@@ -1,0 +1,9 @@
+*.bak
+*.bak.*
+*.log
+*.swp
+*.tmp
+.DS_Store
+Thumbs.db
+/tmp/
+node_modules/
