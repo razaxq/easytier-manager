@@ -231,7 +231,8 @@ gen_secret() {
         dd if=/dev/urandom bs=32 count=1 2>/dev/null | \
             od -An -tx1 | tr -d ' \n' | head -c 64
     else
-        # 最后备选（强度低，仅应急）
+        # 最后备选（强度低，仅应急）。$RANDOM 在 busybox ash 可用；POSIX 未定义时回退为 0。
+        # shellcheck disable=SC3028
         printf '%s%s%s' "$(date +%s)" "$$" "${RANDOM:-0}" | \
             od -An -tx1 | tr -d ' \n' | head -c 32
         msg_warn "无法读取 /dev/urandom，密钥强度较低，建议上线前手动替换"

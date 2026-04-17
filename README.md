@@ -154,6 +154,6 @@ A: 主菜单选 `1)`，脚本会拉取最新 Release 列表。「仅更新二进
 
 ## 📄 License
 
-[MIT](LICENSE) © 2026 razaxq
+[MIT](LICENSE) © 2026 Ramos
 
 本脚本与 [EasyTier 上游项目](https://github.com/EasyTier/EasyTier) 无隶属关系。EasyTier 二进制的版权归其作者所有。
