@@ -29,15 +29,35 @@
 #    ET_PEERS=tcp://a:11010,tcp://b:11010  — 逗号分隔的 Peer 列表
 #    ET_PROXY_CIDR=192.168.1.0/24          — 子网代理 CIDR（可选）
 #    ET_WEB_URL=udp://host:22020/user      — Web 模式接入 URL
+#    ET_FILE_LOG_DIR=/var/log/easytier     — core 日志目录（默认）
+#    ET_FILE_LOG_LEVEL=error               — core 日志级别（off|error|warn|info|debug|trace，默认 error）
+#    ET_FILE_LOG_SIZE=10                   — 每份日志大小 MB（默认 10）
+#    ET_FILE_LOG_COUNT=5                   — 保留日志份数（默认 5）
+#    ET_INSTALL_WEB_GUI=1                  — 安装 easytier-web GUI 客户端（默认不装）
+# 注: procd（OpenWrt）下 ET_BACKUP_KEEP/LOG_SIZE/LOG_COUNT 默认自动收紧为 1/2/3
 # ==============================================================================
 
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.2.0"
 
 # ── 可调参数 ──────────────────────────────────────────
+# 这些 sentinel 记录用户是否显式设置了对应变量；detect_system 后 procd 下会
+# 据此判断是否套用更紧的默认值（用户显式设的优先）
+_u_backup=${ET_BACKUP_KEEP:+1}
+_u_lsize=${ET_FILE_LOG_SIZE:+1}
+_u_lcount=${ET_FILE_LOG_COUNT:+1}
+
 ET_BACKUP_KEEP="${ET_BACKUP_KEEP:-3}"           # 每个二进制保留的备份份数
 ET_RELEASES_COUNT="${ET_RELEASES_COUNT:-20}"    # 版本列表最多拉取条数
+ET_INSTALL_WEB_GUI="${ET_INSTALL_WEB_GUI:-0}"   # 1=同时安装 easytier-web GUI 客户端
 LOG_FILE="${LOG_FILE:-/var/log/easytier-manager.log}"
 TMP_DIR="/tmp/et_mgr_$$"
+
+# core 文件日志参数 — 默认避免 EasyTier 写入 100MB×10 到进程 cwd
+# 注意：OpenWrt 上 /var → /tmp（tmpfs），重启自清；其他发行版持久化
+ET_FILE_LOG_DIR="${ET_FILE_LOG_DIR:-/var/log/easytier}"
+ET_FILE_LOG_LEVEL="${ET_FILE_LOG_LEVEL:-error}"  # off|error|warn|info|debug|trace
+ET_FILE_LOG_SIZE="${ET_FILE_LOG_SIZE:-10}"       # 每份日志大小 (MB)
+ET_FILE_LOG_COUNT="${ET_FILE_LOG_COUNT:-5}"      # 最多保留日志份数
 
 # ── 运行时状态（检测填充，不要手动修改） ──────────────
 OS_TYPE=""      # openwrt | debian | rhel | arch | alpine | unknown
@@ -45,6 +65,7 @@ INIT_SYS=""     # procd | systemd | openrc | unknown
 ARCH_NAME=""    # x86_64 | aarch64 | armv7 | riscv64 | unknown
 VER=""          # 选定版本，如 v2.4.5
 EXTRACT_DIR=""  # 解压目录（do_download 写入）
+KEEP_BACKUP=0   # do_install_bins 决定是否备份；_install_extra_bin 沿用此决定
 
 # TOML 向导临时变量
 _TOML_INSTANCE=""
@@ -221,6 +242,28 @@ is_valid_cidr() {
 
 is_valid_url() {
     printf '%s' "$1" | grep -qE '^(tcp|udp|ws|wss)://'
+}
+
+# 返回路径所在文件系统的可用空间 (MB)，失败时为空
+# 使用 POSIX df -kP（OpenWrt busybox / Alpine 均支持，-P 防止设备名换行干扰列号）
+_avail_mb() {
+    df -kP "$1" 2>/dev/null | awk 'NR==2 {printf "%d", $4/1024}'
+}
+
+# 检查路径可用空间是否 >= need_mb；非交互模式下不足则 die，交互模式询问
+# $1 path  $2 need_mb  $3 label
+_check_space() {
+    local path="$1" need="$2" label="$3"
+    local have; have=$(_avail_mb "$path")
+    [ -z "$have" ] && return 0          # df 失败，跳过检查而非阻塞
+    [ "$have" -ge "$need" ] && return 0
+    msg_warn "${label} 空间不足: 可用 ${have}MB / 需要约 ${need}MB"
+    if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
+        die "${label} 空间不足，非交互模式拒绝继续"
+    fi
+    printf "  仍要继续? [y/N]: "
+    local a; read -r a
+    case "$a" in y|Y) return 0 ;; *) return 1 ;; esac
 }
 
 # 生成 URL 安全随机密钥（64 hex 字符）
@@ -638,6 +681,9 @@ do_download() {
     msg_info "版本: ${ver}  架构: ${arch}"
     msg_info "URL:  ${url}"
 
+    # /tmp 至少需容纳 zip (~30MB) + 解压后内容 (~80MB)
+    _check_space "/tmp" 120 "/tmp (下载 + 解压)" || return 1
+
     mkdir -p "$TMP_DIR"
     if ! curl -L --progress-bar --retry 3 --retry-delay 3 --connect-timeout 15 \
             -o "${TMP_DIR}/${zip_name}" "$url"; then
@@ -679,17 +725,55 @@ do_install_bins() {
     local ts; ts=$(date +%s)
     local installed=0
 
+    # 本次默认只装 core+cli（节点必备）；web-embed 在 setup_web_console 按需装；
+    # easytier-web GUI 仅在 ET_INSTALL_WEB_GUI=1 时装
+    local install_list="easytier-core easytier-cli"
+    [ "$ET_INSTALL_WEB_GUI" = "1" ] && install_list="$install_list easytier-web"
+
+    # 决定是否备份旧二进制（默认不备份；存在旧版本时询问）
+    KEEP_BACKUP=0
+    local has_existing=0
+    for bin in easytier-core easytier-cli easytier-web easytier-web-embed; do
+        [ -f "/usr/bin/$bin" ] && { has_existing=1; break; }
+    done
+    if [ "$has_existing" = "1" ]; then
+        if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
+            # 非交互：ET_BACKUP_KEEP=0 等价于不备份；>0 则备份并保留指定份数
+            [ "$ET_BACKUP_KEEP" -gt 0 ] && KEEP_BACKUP=1
+        else
+            printf "  保留旧二进制为备份 (.bak.<ts>)? [y/N]: "
+            read -r a
+            case "$a" in y|Y) KEEP_BACKUP=1 ;; esac
+        fi
+    fi
+
+    # 估算待装二进制总大小，做 /usr/bin 空间预检
+    local need_mb=0
+    for bin in $install_list; do
+        if [ -f "${extract_dir}/${bin}" ]; then
+            local kb; kb=$(du -sk "${extract_dir}/${bin}" 2>/dev/null | awk '{print $1}')
+            [ -n "$kb" ] && need_mb=$(( need_mb + (kb / 1024) + 1 ))
+        fi
+    done
+    [ "$need_mb" -gt 0 ] && { _check_space "/usr/bin" "$need_mb" "/usr/bin" || return 1; }
+
     section "安装二进制文件 → /usr/bin/"
     for bin in easytier-core easytier-cli easytier-web easytier-web-embed; do
-        if [ -f "${extract_dir}/${bin}" ]; then
-            [ -f "/usr/bin/$bin" ] && mv "/usr/bin/$bin" "/usr/bin/${bin}.bak.${ts}"
+        local will_install=0
+        for w in $install_list; do [ "$w" = "$bin" ] && will_install=1 && break; done
+        if [ "$will_install" = "1" ] && [ -f "${extract_dir}/${bin}" ]; then
+            if [ "$KEEP_BACKUP" = "1" ] && [ -f "/usr/bin/$bin" ]; then
+                mv "/usr/bin/$bin" "/usr/bin/${bin}.bak.${ts}"
+            fi
             mv "${extract_dir}/${bin}" /usr/bin/
             chmod +x "/usr/bin/${bin}"
             local size; size=$(du -sh "/usr/bin/${bin}" 2>/dev/null | awk '{print $1}')
             printf "  ${C_GRN}✓${C_RST}  %-30s  %s\n" "$bin" "$size"
             installed=$((installed + 1))
-        else
+        elif [ "$will_install" = "1" ]; then
             printf "  ${C_DIM}-  %-30s  (此版本未包含)${C_RST}\n" "$bin"
+        else
+            printf "  ${C_DIM}-  %-30s  (跳过，按需安装)${C_RST}\n" "$bin"
         fi
     done
 
@@ -702,31 +786,79 @@ do_install_bins() {
 
     printf "\n"
     msg_ok "安装完成: $(/usr/bin/easytier-core --version)"
+    # _prune_backups 始终运行：本次未备份也会清理历史遗留备份至 ET_BACKUP_KEEP 份
     _prune_backups
     return 0
 }
 
 # ==============================================================================
-#  备份清理（每个二进制只保留最近 N 份）
+#  按需安装额外二进制（web-embed 走这条路径）
 # ==============================================================================
+_install_extra_bin() {
+    local bin="$1"
+    if [ -n "$EXTRACT_DIR" ] && [ -f "${EXTRACT_DIR}/${bin}" ]; then
+        if [ "${KEEP_BACKUP:-0}" = "1" ] && [ -f "/usr/bin/$bin" ]; then
+            local ts; ts=$(date +%s)
+            mv "/usr/bin/$bin" "/usr/bin/${bin}.bak.${ts}"
+        fi
+        mv "${EXTRACT_DIR}/${bin}" /usr/bin/ && chmod +x "/usr/bin/$bin"
+        local size; size=$(du -sh "/usr/bin/${bin}" 2>/dev/null | awk '{print $1}')
+        msg_ok "按需安装 ${bin}${size:+ ($size)}"
+        return 0
+    fi
+    [ -f "/usr/bin/$bin" ] && return 0
+    msg_warn "${bin} 不在已下载的压缩包中，且未安装"
+    msg_info "请先在主菜单选「1) 更新 / 重装」获取此版本完整压缩包"
+    return 1
+}
+
+# ==============================================================================
+#  备份清理（按 glob 与 ET_BACKUP_KEEP 修剪）
+# ==============================================================================
+_prune_glob() {
+    local pat="$1" label="$2"
+    local count
+    count=$(ls $pat 2>/dev/null | wc -l | tr -d ' ')
+    [ "$count" -le "$ET_BACKUP_KEEP" ] && return 0
+    local del=$(( count - ET_BACKUP_KEEP ))
+    ls -t $pat 2>/dev/null | tail -n "$del" | \
+        while read -r f; do
+            rm -f "$f"
+            msg_info "清理旧${label}: $(basename "$f")"
+        done
+}
+
 _prune_backups() {
     for bin in easytier-core easytier-cli easytier-web easytier-web-embed; do
-        local count
-        count=$(ls /usr/bin/${bin}.bak.* 2>/dev/null | wc -l | tr -d ' ')
-        if [ "$count" -gt "$ET_BACKUP_KEEP" ]; then
-            local del=$(( count - ET_BACKUP_KEEP ))
-            ls -t /usr/bin/${bin}.bak.* 2>/dev/null | tail -n "$del" | \
-                while read -r f; do
-                    rm -f "$f"
-                    msg_info "清理旧备份: $(basename "$f")"
-                done
-        fi
+        _prune_glob "/usr/bin/${bin}.bak.*" "二进制备份"
     done
+    _prune_glob "/etc/easytier/config.toml.bak.*" "配置备份"
+}
+
+# ==============================================================================
+#  core.args 写入 — 含日志参数
+#
+#  $1: opener flag（--config-file | -w）
+#  $2: opener value（toml 路径或 web url）
+#
+#  EasyTier 默认会向 cwd 写 100MB×10 份的滚动日志；procd 下 cwd=/，会撑爆根分区。
+#  因此始终显式设置 --file-log-{dir,level,size,count}。
+# ==============================================================================
+_write_core_args() {
+    mkdir -p /etc/easytier "$ET_FILE_LOG_DIR" 2>/dev/null || true
+    printf '%s\n' \
+        "$1" "$2" \
+        "--file-log-dir"   "$ET_FILE_LOG_DIR" \
+        "--file-log-level" "$ET_FILE_LOG_LEVEL" \
+        "--file-log-size"  "$ET_FILE_LOG_SIZE" \
+        "--file-log-count" "$ET_FILE_LOG_COUNT" \
+        > /etc/easytier/core.args
+    chmod 600 /etc/easytier/core.args
 }
 
 # ==============================================================================
 #  TOML 配置向导
-# 
+#
 # ==============================================================================
 _toml_wizard() {
     section "TOML 配置向导"
@@ -865,17 +997,17 @@ setup_toml_config() {
         if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
             msg_info "非交互模式：自动备份并覆盖配置"
             cp /etc/easytier/config.toml "/etc/easytier/config.toml.bak.$(date +%s)"
+            _prune_glob "/etc/easytier/config.toml.bak.*" "配置备份"
         else
             printf "  配置文件已存在，覆盖? [y/N/0=返回]: "
             read -r a
             case "$a" in
                 0)    return 1 ;;
-                y|Y)  cp /etc/easytier/config.toml "/etc/easytier/config.toml.bak.$(date +%s)" ;;
+                y|Y)  cp /etc/easytier/config.toml "/etc/easytier/config.toml.bak.$(date +%s)"
+                      _prune_glob "/etc/easytier/config.toml.bak.*" "配置备份" ;;
                 *)    msg_info "已保留原配置文件"
                       # 保留原文件，仍更新 core.args 指向它
-                      printf '%s\n' "--config-file" "/etc/easytier/config.toml" \
-                          > /etc/easytier/core.args
-                      chmod 600 /etc/easytier/core.args
+                      _write_core_args "--config-file" "/etc/easytier/config.toml"
                       return 0 ;;
             esac
         fi
@@ -884,9 +1016,7 @@ setup_toml_config() {
     _toml_wizard
     _toml_write_config
 
-    printf '%s\n' "--config-file" "/etc/easytier/config.toml" \
-        > /etc/easytier/core.args
-    chmod 600 /etc/easytier/core.args
+    _write_core_args "--config-file" "/etc/easytier/config.toml"
     return 0
 }
 
@@ -896,6 +1026,9 @@ setup_toml_config() {
 # ==============================================================================
 setup_web_console() {
     section "配置 easytier-web-embed"
+
+    # 按需安装 web-embed（do_install_bins 默认不装它）
+    _install_extra_bin easytier-web-embed || return 1
 
     # ── API 端口 ──────────────────────────────────────
     local api_port
@@ -972,9 +1105,7 @@ ask_core_web_url() {
 
     # 非交互模式
     if [ -n "${ET_WEB_URL:-}" ]; then
-        mkdir -p /etc/easytier
-        printf '%s\n' "-w" "$ET_WEB_URL" > /etc/easytier/core.args
-        chmod 600 /etc/easytier/core.args
+        _write_core_args "-w" "$ET_WEB_URL"
         msg_ok "接入 URL 已保存（非交互）: $ET_WEB_URL"
         return 0
     fi
@@ -1003,9 +1134,7 @@ ask_core_web_url() {
                     msg_warn "URL 须以 tcp:// udp:// ws:// wss:// 开头"
                     continue
                 fi
-                mkdir -p /etc/easytier
-                printf '%s\n' "-w" "$w_url" > /etc/easytier/core.args
-                chmod 600 /etc/easytier/core.args
+                _write_core_args "-w" "$w_url"
                 msg_ok "接入 URL 已保存: $w_url"
                 return 0
                 ;;
@@ -1049,10 +1178,7 @@ do_setup_mode() {
                 case "$rw" in
                     0) continue ;;
                     1)
-                        if [ ! -f /usr/bin/easytier-web-embed ]; then
-                            msg_warn "easytier-web-embed 未安装，此版本可能不包含"
-                            continue
-                        fi
+                        # setup_web_console 自己会按需安装 easytier-web-embed
                         setup_web_console || continue
                         ask_core_web_url "true" && return 0 || continue
                         ;;
@@ -1246,6 +1372,13 @@ show_file_locations() {
     printf '\n'
     printf "  ${C_BLD}[ 日志 ]${C_RST}\n"
     printf "  安装日志: %s\n" "$LOG_FILE"
+    if [ -d "$ET_FILE_LOG_DIR" ]; then
+        local cur_log_size
+        cur_log_size=$(du -sh "$ET_FILE_LOG_DIR" 2>/dev/null | awk '{print $1}')
+        printf "  Core 日志: %s/  ${C_DIM}(当前 %s, 上限 %dMB×%d, 级别 %s)${C_RST}\n" \
+            "$ET_FILE_LOG_DIR" "${cur_log_size:-?}" \
+            "$ET_FILE_LOG_SIZE" "$ET_FILE_LOG_COUNT" "$ET_FILE_LOG_LEVEL"
+    fi
     case "$INIT_SYS" in
         procd)   printf "  运行日志: logread -f | grep easytier\n" ;;
         systemd) printf "  运行日志: journalctl -u easytier -f\n"
@@ -1253,6 +1386,16 @@ show_file_locations() {
                      printf "            journalctl -u easytier-web -f\n" ;;
         openrc)  printf "  运行日志: tail -f /var/log/easytier.log\n" ;;
     esac
+
+    # 老版本（< 2.1.0）若未设 --file-log-dir，会把 100MB×10 的日志写到 cwd
+    if ls /easytier.log /easytier.log.[0-9] /easytier.log.[0-9][0-9] >/dev/null 2>&1; then
+        local legacy_size
+        legacy_size=$(du -ch /easytier.log* 2>/dev/null | tail -1 | awk '{print $1}')
+        printf '\n'
+        printf "  ${C_YLW}⚠  发现遗留日志 /easytier.log*（%s），可手动清理${C_RST}\n" \
+            "${legacy_size:-?}"
+        printf "  ${C_DIM}   rm -f /easytier.log /easytier.log.[0-9] /easytier.log.[0-9][0-9]${C_RST}\n"
+    fi
 }
 
 # ==============================================================================
@@ -1300,6 +1443,32 @@ do_uninstall() {
         y|Y) rm -rf /etc/easytier && msg_ok "配置目录已删除" ;;
         *)   msg_info "配置目录已保留: /etc/easytier" ;;
     esac
+
+    if [ -d "$ET_FILE_LOG_DIR" ]; then
+        local log_size
+        log_size=$(du -sh "$ET_FILE_LOG_DIR" 2>/dev/null | awk '{print $1}')
+        printf "  删除日志目录 %s (%s)? [y/N]: " "$ET_FILE_LOG_DIR" "${log_size:-?}"
+        read -r a
+        case "$a" in
+            y|Y) rm -rf "$ET_FILE_LOG_DIR" && msg_ok "日志目录已删除" ;;
+            *)   msg_info "日志目录已保留: $ET_FILE_LOG_DIR" ;;
+        esac
+    fi
+
+    # 历史遗留：v2.0.x 之前未设置 --file-log-dir，core 把日志写到 cwd（procd 下=/）
+    local legacy
+    legacy=$(ls /easytier.log /easytier.log.[0-9] /easytier.log.[0-9][0-9] 2>/dev/null) || true
+    if [ -n "$legacy" ]; then
+        local n; n=$(printf '%s\n' "$legacy" | wc -l | tr -d ' ')
+        printf "  发现 %d 个遗留日志文件 (/easytier.log*)，删除? [y/N]: " "$n"
+        read -r a
+        case "$a" in
+            y|Y) printf '%s\n' "$legacy" | while read -r f; do rm -f "$f"; done
+                 msg_ok "遗留日志已清理" ;;
+            *)   msg_info "遗留日志已保留" ;;
+        esac
+    fi
+
     msg_ok "卸载完成"
     return 0
 }
@@ -1356,9 +1525,35 @@ _print_header() {
 main() {
     _init_colors
     detect_system
+
+    # procd（OpenWrt）默认收紧：闪存小、/var → /tmp（tmpfs，吃 RAM）
+    # 用户显式设置过的环境变量优先（_u_* sentinel 由顶部声明记录）
+    if [ "$INIT_SYS" = "procd" ]; then
+        [ -z "$_u_backup" ] && ET_BACKUP_KEEP=1
+        [ -z "$_u_lsize"  ] && ET_FILE_LOG_SIZE=2
+        [ -z "$_u_lcount" ] && ET_FILE_LOG_COUNT=3
+    fi
+
     check_deps
 
-    _log "INFO" "脚本启动 v${SCRIPT_VERSION} OS=${OS_TYPE} INIT=${INIT_SYS} ARCH=${ARCH_NAME}"
+    _log "INFO" "脚本启动 v${SCRIPT_VERSION} OS=${OS_TYPE} INIT=${INIT_SYS} ARCH=${ARCH_NAME} BACKUP=${ET_BACKUP_KEEP} LOG=${ET_FILE_LOG_SIZE}MB×${ET_FILE_LOG_COUNT}"
+
+    # ── 旧版（< 2.1.0）core.args 缺少 --file-log-* 时一次性补齐 ────
+    # 不补齐的话，老的服务仍会把 100MB×10 滚动日志写到 cwd（procd 下=/）
+    if [ -f /etc/easytier/core.args ] && \
+       ! grep -q -- "--file-log-dir" /etc/easytier/core.args; then
+        msg_warn "检测到旧版 core.args 缺少日志参数，正在追加 --file-log-*"
+        mkdir -p "$ET_FILE_LOG_DIR" 2>/dev/null || true
+        printf '%s\n' \
+            "--file-log-dir"   "$ET_FILE_LOG_DIR" \
+            "--file-log-level" "$ET_FILE_LOG_LEVEL" \
+            "--file-log-size"  "$ET_FILE_LOG_SIZE" \
+            "--file-log-count" "$ET_FILE_LOG_COUNT" \
+            >> /etc/easytier/core.args
+        chmod 600 /etc/easytier/core.args
+        svc_write_core 2>/dev/null || true
+        msg_info "请在主菜单选「4) 仅重启服务」让新参数生效"
+    fi
 
     while true; do
         _print_header
@@ -1411,6 +1606,8 @@ main() {
                         1)
                             do_download "$VER" "$ARCH_NAME"  || continue
                             do_install_bins "$EXTRACT_DIR"   || continue
+                            # 现有配置有 web.args 说明本机跑过 web-embed，按需跟着升级
+                            [ -f /etc/easytier/web.args ] && _install_extra_bin easytier-web-embed
                             # 重写服务文件（systemd ExecStart 含版本路径，需更新）
                             [ -f /etc/easytier/core.args ] && svc_write_core || true
                             svc_start
@@ -1487,10 +1684,7 @@ main() {
 
             # ── Web 管理 ───────────────────────────────────
             6)
-                [ -f /usr/bin/easytier-web-embed ] || {
-                    msg_warn "easytier-web-embed 未安装（此版本可能不包含）"
-                    continue
-                }
+                # do_manage_web 内子菜单 3 调 setup_web_console 会按需安装 web-embed
                 do_manage_web
                 ;;
 
