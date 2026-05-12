@@ -728,10 +728,17 @@ do_install_bins() {
     local ts; ts=$(date +%s)
     local installed=0
 
-    # 本次默认只装 core+cli（节点必备）；web-embed 在 setup_web_console 按需装；
-    # easytier-web GUI 仅在 ET_INSTALL_WEB_GUI=1 时装
+    # 本次默认只装 core+cli（节点必备）；其余按需 / 按"曾经装过"自动加入
+    # — easytier-web GUI 仅在 ET_INSTALL_WEB_GUI=1 时装
+    # — 已部署的额外二进制一律跟着升级，避免 core 升级后 web-embed 版本错配
     local install_list="easytier-core easytier-cli"
     [ "$ET_INSTALL_WEB_GUI" = "1" ] && install_list="$install_list easytier-web"
+    for _bin in easytier-web easytier-web-embed; do
+        case " $install_list " in
+            *" $_bin "*) ;;
+            *) [ -f "/usr/bin/$_bin" ] && install_list="$install_list $_bin" ;;
+        esac
+    done
 
     # 决定是否备份旧二进制（默认不备份；存在旧版本时询问）
     KEEP_BACKUP=0
