@@ -1409,18 +1409,41 @@ show_file_locations() {
 }
 
 # ==============================================================================
-#  卸载
+#  卸载 — 单个二进制（同时清理它管的服务，但不动配置/备份/日志）
 # ==============================================================================
-do_uninstall() {
-    section "卸载 EasyTier"
-    printf "  ${C_YLW}⚠  此操作将移除所有 EasyTier 相关服务和二进制${C_RST}\n\n"
-    printf "  确认卸载? [y/N/0=返回]: "
-    read -r a
-    case "$a" in
-        0)    return 1 ;;
-        y|Y)  ;;
-        *)    msg_info "已取消"; return 1 ;;
+_uninstall_one() {
+    local bin="$1"
+    printf "  确认移除 ${C_BLD}%s${C_RST}? [y/N]: " "$bin"
+    local a; read -r a
+    case "$a" in y|Y) ;; *) msg_info "已取消"; return 1 ;; esac
+
+    case "$bin" in
+        easytier-core)
+            msg_info "停止并移除 easytier 服务..."
+            svc_stop; svc_remove
+            killall easytier-core 2>/dev/null || true
+            ip link del easytier0 2>/dev/null || true
+            ;;
+        easytier-web-embed)
+            msg_info "停止并移除 easytier-web 服务..."
+            svc_stop_web; svc_remove_web
+            killall easytier-web-embed 2>/dev/null || true
+            ;;
     esac
+
+    rm -f "/usr/bin/$bin"
+    msg_ok "${bin} 已移除"
+    return 0
+}
+
+# ==============================================================================
+#  卸载 — 全部（含服务/配置/备份/日志/遗留日志）
+# ==============================================================================
+_uninstall_all() {
+    printf "  ${C_YLW}⚠  此操作将移除所有 EasyTier 相关服务和二进制${C_RST}\n"
+    printf "  确认全部卸载? [y/N]: "
+    local a; read -r a
+    case "$a" in y|Y) ;; *) msg_info "已取消"; return 1 ;; esac
 
     msg_info "停止并移除服务..."
     svc_stop; svc_stop_web
@@ -1481,6 +1504,60 @@ do_uninstall() {
 
     msg_ok "卸载完成"
     return 0
+}
+
+# ==============================================================================
+#  卸载入口 — 让用户选单个二进制或全部
+# ==============================================================================
+do_uninstall() {
+    section "卸载 EasyTier"
+
+    # 收集当前已装的二进制
+    local installed="" idx=0
+    for bin in easytier-core easytier-cli easytier-web easytier-web-embed; do
+        [ -f "/usr/bin/$bin" ] && installed="${installed}${installed:+ }$bin"
+    done
+    if [ -z "$installed" ]; then
+        msg_warn "未发现任何 EasyTier 二进制"
+        return 1
+    fi
+
+    printf "  已安装的二进制：\n\n"
+    idx=0
+    for bin in $installed; do
+        idx=$((idx + 1))
+        local size; size=$(du -sh "/usr/bin/$bin" 2>/dev/null | awk '{print $1}')
+        local tag=""
+        case "$bin" in
+            easytier-core)      tag="  ${C_DIM}(含 easytier 服务)${C_RST}" ;;
+            easytier-web-embed) tag="  ${C_DIM}(含 easytier-web 服务)${C_RST}" ;;
+        esac
+        printf "  ${C_BLD}%d)${C_RST}  %-22s %s%s\n" "$idx" "$bin" "$size" "$tag"
+    done
+    local all_idx=$((idx + 1))
+    printf "  ${C_BLD}%d)${C_RST}  ${C_YLW}全部删除${C_RST}  ${C_DIM}(含服务/配置/备份/日志)${C_RST}\n" "$all_idx"
+    printf "  ${C_BLD}0)${C_RST}  返回\n\n"
+    printf "  请选择 [0-%d]: " "$all_idx"
+    local choice; read -r choice
+
+    [ "$choice" = "0" ] && return 1
+    [ "$choice" = "$all_idx" ] && { _uninstall_all; return $?; }
+
+    # 校验数字范围
+    if ! printf '%s' "$choice" | grep -qE '^[0-9]+$' || \
+       [ "$choice" -lt 1 ] || [ "$choice" -gt "$idx" ]; then
+        msg_warn "无效选择"
+        return 1
+    fi
+
+    # 映射到 installed 列表第 N 个
+    local target="" i=0
+    for bin in $installed; do
+        i=$((i + 1))
+        [ "$i" = "$choice" ] && { target="$bin"; break; }
+    done
+    _uninstall_one "$target"
+    return $?
 }
 
 # ==============================================================================
