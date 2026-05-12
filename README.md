@@ -18,8 +18,9 @@
 - ⚙️  **多 init 系统** —— procd（OpenWrt）/ systemd / OpenRC，服务文件自动生成
 - 🔒  **输入校验** —— CIDR、URL、端口格式检查，密钥强度检测
 - 🤖  **非交互模式** —— 环境变量预设全部参数，可用于 Ansible / CI
-- 📦  **版本备份** —— 更新时自动保留旧二进制（可配数量），可随时回滚
-- 📋  **日志追踪** —— 所有操作写入 `/var/log/easytier-manager.log`
+- 📦  **版本备份** —— 更新时可选保留旧二进制（默认不保留；保留时按数量自动轮换，配置备份同步轮转）
+- 📋  **日志管理** —— 脚本操作日志写入 `/var/log/easytier-manager.log`；自动配置 core 文件日志大小与轮转，避免日志填满磁盘
+- 🪶  **小闪存友好** —— 仅安装必需二进制（默认跳过 `easytier-web` GUI 与未启用的 `easytier-web-embed`）；procd 下日志/备份默认值自动收紧；下载与安装前进行磁盘空间预检
 
 ---
 
@@ -70,7 +71,7 @@ sudo ET_NONINTERACTIVE=1 \
 
 ```
   ──────────────────────────────────────────
-    EasyTier 管理脚本  v2.0.0
+    EasyTier 管理脚本  vX.Y.Z
   ──────────────────────────────────────────
   系统  debian        架构  x86_64
   Init  systemd
@@ -102,9 +103,14 @@ sudo ET_NONINTERACTIVE=1 \
 | `ET_PEERS` | 逗号分隔 Peer 列表 | `tcp://a:11010,udp://b:11010` |
 | `ET_PROXY_CIDR` | 子网代理 CIDR（可选） | `192.168.1.0/24` |
 | `ET_WEB_URL` | Web 模式接入 URL | `udp://host:22020/user` |
-| `ET_BACKUP_KEEP` | 每个二进制保留的备份份数 | `3`（默认） |
+| `ET_BACKUP_KEEP` | 每个二进制 / 配置保留的备份份数（非交互下 `0` = 不备份） | `3`（默认；procd 下 `1`） |
 | `ET_RELEASES_COUNT` | 版本列表最多条数 | `20`（默认） |
-| `LOG_FILE` | 日志文件路径 | `/var/log/easytier-manager.log` |
+| `ET_INSTALL_WEB_GUI` | `1` 时安装 `easytier-web` GUI 客户端 | `0`（默认不装） |
+| `ET_FILE_LOG_DIR` | core 文件日志目录 | `/var/log/easytier`（默认） |
+| `ET_FILE_LOG_LEVEL` | core 文件日志级别 | `error`（默认；可选 `off`/`error`/`warn`/`info`/`debug`/`trace`） |
+| `ET_FILE_LOG_SIZE` | 每份日志大小 (MB) | `10`（默认；procd 下 `2`） |
+| `ET_FILE_LOG_COUNT` | 最多保留日志份数 | `5`（默认；procd 下 `3`） |
+| `LOG_FILE` | 脚本日志文件路径 | `/var/log/easytier-manager.log` |
 
 ---
 
@@ -112,13 +118,16 @@ sudo ET_NONINTERACTIVE=1 \
 
 | 路径 | 说明 |
 |---|---|
-| `/usr/bin/easytier-core` `easytier-cli` `easytier-web` `easytier-web-embed` | 主二进制 |
-| `/usr/bin/easytier-*.bak.<ts>` | 旧版本备份（自动轮换） |
+| `/usr/bin/easytier-core` `easytier-cli` | 节点必备二进制（始终安装） |
+| `/usr/bin/easytier-web-embed` | Web 控制台守护进程（仅 Web 自建模式按需安装） |
+| `/usr/bin/easytier-web` | 独立 GUI 客户端（仅 `ET_INSTALL_WEB_GUI=1` 时安装） |
+| `/usr/bin/easytier-*.bak.<ts>` | 旧版本备份（询问保留；轮换数 = `ET_BACKUP_KEEP`） |
 | `/etc/easytier/config.toml` | TOML 模式配置 |
 | `/etc/easytier/core.args` | core 启动参数 |
 | `/etc/easytier/web.args` | web-embed 启动参数 |
 | `/etc/systemd/system/easytier.service` 等 | 服务单元（按 init 系统） |
 | `/var/log/easytier-manager.log` | 脚本自身日志 |
+| `/var/log/easytier/` | easytier-core 文件日志（按大小轮转，OpenWrt 上落在 tmpfs） |
 
 ---
 

@@ -5,7 +5,7 @@
 # shellcheck disable=SC2155  # declare-and-assign — readable for local scalar capture
 # ==============================================================================
 #  easytier-manager.sh — EasyTier 安装与管理脚本
-#  版本: 2.0.0
+#  版本: 见下方 SCRIPT_VERSION（单一来源；菜单标题与日志均读此变量）
 #  仓库: https://github.com/razaxq/easytier-manager
 #  上游: https://github.com/EasyTier/EasyTier
 #  License: MIT (c) 2026 razaxq
@@ -29,12 +29,14 @@
 #    ET_PEERS=tcp://a:11010,tcp://b:11010  — 逗号分隔的 Peer 列表
 #    ET_PROXY_CIDR=192.168.1.0/24          — 子网代理 CIDR（可选）
 #    ET_WEB_URL=udp://host:22020/user      — Web 模式接入 URL
-#    ET_FILE_LOG_DIR=/var/log/easytier     — core 日志目录（默认）
-#    ET_FILE_LOG_LEVEL=error               — core 日志级别（off|error|warn|info|debug|trace，默认 error）
-#    ET_FILE_LOG_SIZE=10                   — 每份日志大小 MB（默认 10）
-#    ET_FILE_LOG_COUNT=5                   — 保留日志份数（默认 5）
-#    ET_INSTALL_WEB_GUI=1                  — 安装 easytier-web GUI 客户端（默认不装）
-# 注: procd（OpenWrt）下 ET_BACKUP_KEEP/LOG_SIZE/LOG_COUNT 默认自动收紧为 1/2/3
+#    ET_FILE_LOG_DIR=...                   — core 日志目录
+#    ET_FILE_LOG_LEVEL=off|error|warn|info|debug|trace
+#    ET_FILE_LOG_SIZE=<MB>                 — 每份日志大小
+#    ET_FILE_LOG_COUNT=<N>                 — 保留日志份数
+#    ET_INSTALL_WEB_GUI=1                  — 安装 easytier-web GUI 客户端
+#    ET_DEFAULT_VERSION=v2.4.5             — GitHub API 失败时回退的版本号
+# 注: 默认值见下方 ── 可调参数 ── 区；procd（OpenWrt）下 BACKUP_KEEP/LOG_SIZE/LOG_COUNT
+#     由 main() 自动收紧（用户显式设的值仍优先）
 # ==============================================================================
 
 SCRIPT_VERSION="2.2.0"
@@ -49,6 +51,7 @@ _u_lcount=${ET_FILE_LOG_COUNT:+1}
 ET_BACKUP_KEEP="${ET_BACKUP_KEEP:-3}"           # 每个二进制保留的备份份数
 ET_RELEASES_COUNT="${ET_RELEASES_COUNT:-20}"    # 版本列表最多拉取条数
 ET_INSTALL_WEB_GUI="${ET_INSTALL_WEB_GUI:-0}"   # 1=同时安装 easytier-web GUI 客户端
+ET_DEFAULT_VERSION="${ET_DEFAULT_VERSION:-v2.4.5}"  # GitHub API 失败时回退的版本号
 LOG_FILE="${LOG_FILE:-/var/log/easytier-manager.log}"
 TMP_DIR="/tmp/et_mgr_$$"
 
@@ -63,7 +66,7 @@ ET_FILE_LOG_COUNT="${ET_FILE_LOG_COUNT:-5}"      # 最多保留日志份数
 OS_TYPE=""      # openwrt | debian | rhel | arch | alpine | unknown
 INIT_SYS=""     # procd | systemd | openrc | unknown
 ARCH_NAME=""    # x86_64 | aarch64 | armv7 | riscv64 | unknown
-VER=""          # 选定版本，如 v2.4.5
+VER=""          # 选定版本（select_version 写入；失败回退到 $ET_DEFAULT_VERSION）
 EXTRACT_DIR=""  # 解压目录（do_download 写入）
 KEEP_BACKUP=0   # do_install_bins 决定是否备份；_install_extra_bin 沿用此决定
 
@@ -555,8 +558,8 @@ select_version() {
     local rel_file="${TMP_DIR}/releases.txt"
 
     if [ -z "$json" ]; then
-        msg_warn "获取失败，回退到内置默认版本 v2.4.5"
-        VER="v2.4.5"; return 0
+        msg_warn "获取失败，回退到内置默认版本 ${ET_DEFAULT_VERSION}"
+        VER="$ET_DEFAULT_VERSION"; return 0
     fi
 
     # 解析逻辑：
@@ -609,8 +612,8 @@ select_version() {
     count=$(wc -l < "$rel_file" | tr -d ' \t')
 
     if [ "$count" -eq 0 ]; then
-        msg_warn "解析失败，回退到内置默认版本 v2.4.5"
-        VER="v2.4.5"; return 0
+        msg_warn "解析失败，回退到内置默认版本 ${ET_DEFAULT_VERSION}"
+        VER="$ET_DEFAULT_VERSION"; return 0
     fi
 
     while true; do
