@@ -12,14 +12,21 @@
 
 ## 🌐 语言 / Language
 
-本仓库提供两个**逻辑完全一致、仅界面/注释语言不同**的脚本：
+脚本**内置中英双语**，语言选择顺序为：`ET_LANG` 环境变量 > 系统 locale 自动识别（`zh*` → 中文）> 默认英文。
 
-| 文件 | 界面语言 | Raw URL |
-|---|---|---|
-| **`easytier.sh`**（默认 / default） | English | `.../main/easytier.sh` |
-| `easytier.zh.sh` | 简体中文 | `.../main/easytier.zh.sh` |
+| 文件 | 默认界面语言 | 说明 | Raw URL |
+|---|---|---|---|
+| **`easytier.sh`**（单一真源） | 跟随 locale（默认 English） | 双语脚本，`zh_CN` 等中文环境自动显示中文 | `.../main/easytier.sh` |
+| `easytier.zh.sh` | 简体中文（强制） | 由 `easytier.sh` **自动生成**，即使英文 locale 也显示中文 | `.../main/easytier.zh.sh` |
 
-> The default **`easytier.sh` is in English**. For a Simplified-Chinese UI, use **`easytier.zh.sh`** — the two scripts are functionally identical; pick whichever language you prefer.
+强制指定语言（对两个文件都生效）：
+
+```sh
+ET_LANG=zh sh easytier.sh    # 强制中文
+ET_LANG=en sh easytier.zh.sh # 强制英文
+```
+
+> **`easytier.sh` is a single bilingual script.** It auto-detects the language from your locale (`zh*` → Chinese, otherwise English) and honors `ET_LANG=en|zh`. `easytier.zh.sh` is **generated** from it (identical code, just defaulting to Chinese) so Chinese users on an English-locale host can still `curl … easytier.zh.sh | sh`.
 
 ---
 
@@ -30,7 +37,10 @@
 - 🐧  **多发行版 / 多架构** —— OpenWrt、Debian、Ubuntu、RHEL、Alpine、Arch；x86_64 / aarch64 / armv7 / riscv64
 - ⚙️  **多 init 系统** —— procd（OpenWrt）/ systemd / OpenRC，服务文件自动生成
 - 🔒  **输入校验** —— CIDR、URL、端口格式检查，密钥强度检测
-- 🤖  **非交互模式** —— 环境变量预设全部参数，可用于 Ansible / CI
+- 🤖  **非交互模式 + 子命令** —— 环境变量预设全部参数（Ansible / CI）；`status`/`start`/`stop`/`restart` 一次性子命令便于 cron
+- 🌏  **下载加速与校验** —— 支持 `ET_GITHUB_MIRROR` 前缀镜像 / `https_proxy` 代理 / `ET_GITHUB_TOKEN` 解除 API 限流；版本列表缓存；下载做 zip 魔数与可选 `ET_SHA256` 完整性校验
+- 📡  **网络概览** —— 状态页调用 `easytier-cli` 展示已连接节点与路由
+- 🛡  **服务加固** —— systemd 单元默认启用 `NoNewPrivileges`/`ProtectSystem` 等沙箱项（保证 TUN/转发不受影响）
 - 📦  **版本备份** —— 更新时可选保留旧二进制（默认不保留；保留时按数量自动轮换，配置备份同步轮转）
 - 📋  **日志管理** —— 脚本操作日志写入 `/var/log/easytier-manager.log`；自动配置 core 文件日志大小与轮转，避免日志填满磁盘
 - 🪶  **小闪存友好** —— 仅安装必需二进制（默认跳过 `easytier-web` GUI 与未启用的 `easytier-web-embed`）；procd 下日志/备份默认值自动收紧；下载与安装前进行磁盘空间预检
@@ -117,23 +127,48 @@ sudo ET_NONINTERACTIVE=1 \
   0)  退出
 ```
 
+### 命令行子命令（便于脚本 / cron）
+
+除交互式菜单外，脚本还支持一次性子命令，执行后即退出：
+
+```sh
+sh easytier.sh status     # 服务状态 + 网络概览（easytier-cli peer/route）
+sh easytier.sh start      # 启动 easytier-core（及已配置的 web-embed）
+sh easytier.sh stop       # 停止
+sh easytier.sh restart    # 重启
+sh easytier.sh version    # 打印脚本与 core 版本
+sh easytier.sh help       # 帮助
+```
+
+无参数（或 `menu`）进入交互式菜单。
+
 ### 非交互环境变量
 
 | 变量 | 说明 | 示例 |
 |---|---|---|
+| `ET_LANG` | 强制界面语言（覆盖 locale 自动识别） | `en` 或 `zh` |
 | `ET_NONINTERACTIVE` | 启用非交互模式 | `1` |
 | `ET_VERSION` | 安装版本 | `v2.4.5` |
 | `ET_MODE` | 配置模式 | `toml` 或 `web` |
 | `ET_INSTANCE_NAME` | 节点实例名 | `node-sg-01` |
-| `ET_VIRTUAL_IP` | 虚拟 IPv4（含掩码） | `10.0.0.1/24` |
+| `ET_VIRTUAL_IP` | 虚拟 IPv4（含掩码；`ET_DHCP=1` 时可省略） | `10.0.0.1/24` |
+| `ET_DHCP` | `1` 时用 DHCP 自动分配虚拟 IP（跳过 `ET_VIRTUAL_IP`） | `0`（默认） |
+| `ET_LISTEN_PORT` | 监听基准端口（ws/wss 用 +1/+2） | `11010`（默认） |
+| `ET_DEV_NAME` | TUN 设备名 | `easytier0`（默认） |
 | `ET_NETWORK_NAME` | 虚拟网络名 | `mynet` |
 | `ET_NETWORK_SECRET` | 网络密钥（留空自动生成） | `abc...` |
 | `ET_PEERS` | 逗号分隔 Peer 列表 | `tcp://a:11010,udp://b:11010` |
-| `ET_PROXY_CIDR` | 子网代理 CIDR（可选） | `192.168.1.0/24` |
+| `ET_PROXY_CIDR` | 子网代理 CIDR（可多个，逗号分隔） | `192.168.1.0/24,10.9.0.0/24` |
 | `ET_WEB_URL` | Web 模式接入 URL | `udp://host:22020/user` |
 | `ET_BACKUP_KEEP` | 每个二进制 / 配置保留的备份份数（非交互下 `0` = 不备份） | `3`（默认；procd 下 `1`） |
 | `ET_RELEASES_COUNT` | 版本列表最多条数 | `20`（默认） |
 | `ET_INSTALL_WEB_GUI` | `1` 时安装 `easytier-web` GUI 客户端 | `0`（默认不装） |
+| `ET_GITHUB_MIRROR` | github.com 下载前缀镜像（大陆加速） | `https://ghproxy.com` |
+| `ET_GITHUB_API` | GitHub API 基址（用 API 镜像时覆盖） | `https://api.github.com`（默认） |
+| `ET_GITHUB_TOKEN` | GitHub PAT，解除 60 次/时匿名 API 限流（或用 `GITHUB_TOKEN`） | `ghp_...` |
+| `ET_SHA256` | 期望的发布 zip 的 sha256（完整性校验） | `<hex>` |
+| `ET_CACHE_TTL` | 版本列表缓存秒数（`0` 关闭） | `600`（默认） |
+| `ET_MIN_TMP_MB` | 下载+解压所需 `/tmp` 最小可用空间 (MB) | `120`（默认） |
 | `ET_FILE_LOG_DIR` | core 文件日志目录 | `/var/log/easytier`（默认） |
 | `ET_FILE_LOG_LEVEL` | core 文件日志级别 | `error`（默认；可选 `off`/`error`/`warn`/`info`/`debug`/`trace`） |
 | `ET_FILE_LOG_SIZE` | 每份日志大小 (MB) | `10`（默认；procd 下 `2`） |
@@ -166,12 +201,13 @@ sudo ET_NONINTERACTIVE=1 \
 本地检查：
 
 ```sh
-shellcheck -s sh easytier.sh easytier.zh.sh
+shellcheck -s sh easytier.sh tools/build-zh.sh
+sh tools/build-zh.sh                 # 从 easytier.sh 重新生成 easytier.zh.sh
 ```
 
 CI 会在每次 push / PR 时对所有 `*.sh` 跑 ShellCheck（见 [`.github/workflows/shellcheck.yml`](.github/workflows/shellcheck.yml)）。
 
-> ⚠️ **`easytier.sh`（英文）与 `easytier.zh.sh`（中文）逻辑必须保持一致**：改动逻辑时请同步修改两份，仅界面文案/注释按语言区分。
+> ⚠️ **只需维护 `easytier.sh` 这一个文件**（中英文案都内联在其 `t "en" "zh"` 调用里）。`easytier.zh.sh` 是生成产物：改完 `easytier.sh` 后运行 `sh tools/build-zh.sh` 重新生成并一并提交，切勿手动编辑中文版。
 
 ---
 
@@ -181,7 +217,7 @@ CI 会在每次 push / PR 时对所有 `*.sh` 跑 ShellCheck（见 [`.github/wor
 A: 兼容 OpenWrt（BusyBox ash）和 Alpine（默认无 Bash），让脚本在路由器上也能跑。
 
 **Q: 下载失败怎么办？**
-A: 检查网络；大陆用户可考虑在下载前设置 `https_proxy` 或通过 GitHub 镜像。
+A: 检查网络。大陆用户可设置 `ET_GITHUB_MIRROR=https://ghproxy.com` 走前缀镜像，或设置 `https_proxy` 走代理；若 API 被限流（60 次/时），设置 `ET_GITHUB_TOKEN=<PAT>`。脚本会自动缓存版本列表（`ET_CACHE_TTL` 秒）以减少 API 调用，并对下载文件做 zip 魔数/可选 `ET_SHA256` 完整性校验。
 
 **Q: 卸载后还想保留配置？**
 A: 卸载流程会**分步**询问是否删除备份和 `/etc/easytier`，默认保留。

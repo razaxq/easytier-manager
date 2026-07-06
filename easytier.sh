@@ -1,7 +1,7 @@
 #!/bin/sh
 # shellcheck shell=sh
 # shellcheck disable=SC3043  # `local` — not POSIX strict, but widely supported (dash/busybox)
-# shellcheck disable=SC2059  # printf format with color vars — intentional for ANSI codes
+# shellcheck disable=SC2059  # printf format with color vars / t() — intentional for ANSI codes & i18n
 # shellcheck disable=SC2155  # declare-and-assign — readable for local scalar capture
 # ==============================================================================
 #  easytier-manager.sh — EasyTier install & management script
@@ -9,6 +9,11 @@
 #  Repo: https://github.com/razaxq/easytier-manager
 #  Upstream: https://github.com/EasyTier/EasyTier
 #  License: MIT (c) 2026 razaxq
+# ==============================================================================
+#  Bilingual: one script, English + Chinese. Language pick order:
+#    ET_LANG=en|zh   — explicit override (easytier.zh.sh wrapper sets ET_LANG=zh)
+#    otherwise auto-detected from $LC_ALL / $LC_MESSAGES / $LANG (zh* → Chinese)
+#    default: English
 # ==============================================================================
 #  Supported systems
 #    OpenWrt   (procd)
@@ -20,14 +25,18 @@
 # ------------------------------------------------------------------------------
 #  Non-interactive install (preset all params via env vars):
 #    ET_NONINTERACTIVE=1         — skip all prompts, use defaults or the vars below
+#    ET_LANG=en|zh               — force interface language
 #    ET_VERSION=v2.4.5           — version to install
 #    ET_MODE=toml|web            — config mode
 #    ET_INSTANCE_NAME=mynode     — node instance name
-#    ET_VIRTUAL_IP=10.0.0.1/24  — virtual IPv4 (with mask)
+#    ET_VIRTUAL_IP=10.0.0.1/24  — virtual IPv4 (with mask); omit when ET_DHCP=1
+#    ET_DHCP=1                   — auto-assign the virtual IP via DHCP (skips ET_VIRTUAL_IP)
+#    ET_LISTEN_PORT=11010        — base listen port (ws/wss use +1/+2); default 11010
+#    ET_DEV_NAME=easytier0       — TUN device name
 #    ET_NETWORK_NAME=mynet       — virtual network name
 #    ET_NETWORK_SECRET=xxx       — network secret (auto-generated if empty)
 #    ET_PEERS=tcp://a:11010,tcp://b:11010  — comma-separated peer list
-#    ET_PROXY_CIDR=192.168.1.0/24          — subnet proxy CIDR (optional)
+#    ET_PROXY_CIDR=192.168.1.0/24,10.9.0.0/24  — subnet proxy CIDR(s), comma-separated (optional)
 #    ET_WEB_URL=udp://host:22020/user      — Web mode join URL
 #    ET_FILE_LOG_DIR=...                   — core log directory
 #    ET_FILE_LOG_LEVEL=off|error|warn|info|debug|trace
@@ -35,11 +44,17 @@
 #    ET_FILE_LOG_COUNT=<N>                 — number of logs to keep
 #    ET_INSTALL_WEB_GUI=1                  — install easytier-web GUI client
 #    ET_DEFAULT_VERSION=v2.4.5             — fallback version when GitHub API fails
+#    ET_GITHUB_MIRROR=https://ghproxy.com  — prefix mirror for github.com downloads (helps in CN)
+#    ET_GITHUB_API=https://api.github.com  — GitHub API base override (for an API mirror)
+#    ET_GITHUB_TOKEN=<PAT>                 — lift the 60/h anonymous API rate limit (or GITHUB_TOKEN)
+#    ET_SHA256=<hex>                       — expected sha256 of the release zip (integrity check)
+#    ET_CACHE_TTL=600                      — seconds to reuse the cached release list (0 disables)
+#    (curl also honors the standard https_proxy / http_proxy env vars)
 # Note: defaults are in the ── Tunables ── section below; on procd (OpenWrt) BACKUP_KEEP/LOG_SIZE/LOG_COUNT
 #     are auto-tightened by main() (values you set explicitly still win)
 # ==============================================================================
 
-SCRIPT_VERSION="2.5.0"
+SCRIPT_VERSION="2.6.0"
 
 # ── Tunables ──────────────────────────────────────────
 # These sentinels record whether the user set the vars explicitly; after detect_system, on procd we
@@ -55,6 +70,14 @@ ET_DEFAULT_VERSION="${ET_DEFAULT_VERSION:-v2.4.5}"  # fallback version when GitH
 LOG_FILE="${LOG_FILE:-/var/log/easytier-manager.log}"
 TMP_DIR="/tmp/et_mgr_$$"
 
+# GitHub access — mirror/proxy/token/integrity/cache (all optional; empty = plain github.com)
+ET_GITHUB_API="${ET_GITHUB_API:-https://api.github.com}"   # API base (override for a mirror)
+ET_GITHUB_MIRROR="${ET_GITHUB_MIRROR:-}"                    # ghproxy-style prefix for release downloads
+ET_GITHUB_TOKEN="${ET_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"    # PAT to lift the 60/h anonymous rate limit
+ET_SHA256="${ET_SHA256:-}"                                 # expected sha256 of the release zip (optional)
+ET_CACHE_TTL="${ET_CACHE_TTL:-600}"                        # reuse cached release list within N seconds (0=off)
+CACHE_DIR="${ET_CACHE_DIR:-${TMPDIR:-/tmp}/et_mgr_cache}"  # persists across runs (not wiped by _cleanup)
+
 # All managed binaries (install / backup rotation / uninstall / status all iterate this list; add new binaries here only)
 ET_ALL_BINS="easytier-core easytier-cli easytier-web easytier-web-embed"
 
@@ -64,6 +87,9 @@ ET_FILE_LOG_DIR="${ET_FILE_LOG_DIR:-/var/log/easytier}"
 ET_FILE_LOG_LEVEL="${ET_FILE_LOG_LEVEL:-error}"  # off|error|warn|info|debug|trace
 ET_FILE_LOG_SIZE="${ET_FILE_LOG_SIZE:-10}"       # size per log file (MB)
 ET_FILE_LOG_COUNT="${ET_FILE_LOG_COUNT:-5}"      # max log files to keep
+
+# minimum free space in /tmp for download+extract (zip ~30MB + extracted ~80MB)
+ET_MIN_TMP_MB="${ET_MIN_TMP_MB:-120}"
 
 # ── Runtime state (filled by detection, do not edit by hand) ──────────────
 OS_TYPE=""      # openwrt | debian | rhel | arch | alpine | unknown
@@ -75,11 +101,47 @@ KEEP_BACKUP=0   # do_install_bins decides whether to back up; _install_extra_bin
 
 # TOML wizard temp vars
 _TOML_INSTANCE=""
+_TOML_DHCP="0"          # 1 = auto-assign virtual IP via DHCP
 _TOML_IP=""
+_TOML_LISTEN_PORT=""    # base listen port; +1/+2 derive the ws/wss ports
 _TOML_NET_NAME=""
 _TOML_NET_SECRET=""
 _TOML_PEERS=""          # space-separated
-_TOML_PROXY_CIDR=""
+_TOML_PROXY_CIDRS=""    # space-separated (multiple subnet-proxy CIDRs)
+_TOML_DEV_NAME=""       # TUN device name
+_TOML_ENC="true"        # [flags] enable_encryption
+_TOML_PRIVATE="true"    # [flags] private_mode
+_TOML_EXITNODE="true"   # [flags] enable_exit_node
+_TOML_COMPRESS="2"      # [flags] data_compress_algo
+
+# ==============================================================================
+#  i18n — one script, two languages. t "<english>" "<chinese>" prints the right one.
+#  Rules of thumb used throughout:
+#    · plain text line          → printf '%s\n' "$(t "EN" "ZH")"
+#    · prompt (no newline)      → printf '%s'   "$(t "EN " "ZH ")"
+#    · line with printf args    → printf "$(t "FMT_EN" "FMT_ZH")" args…   (color vars/%-specifiers kept in the format)
+#  _log() diagnostic strings intentionally stay English for greppable logs.
+# ==============================================================================
+# ET_LANG_DEFAULT is the only line that differs between easytier.sh (en) and the
+# generated easytier.zh.sh (zh). tools/build-zh.sh flips it. Do not rename the marker.
+ET_LANG_DEFAULT="en"        # et:lang-default
+_LANG="en"
+_detect_lang() {
+    case "${ET_LANG:-}" in
+        zh|zh[_-]*|ZH|Zh) _LANG="zh"; return ;;
+        en|en[_-]*|EN|En) _LANG="en"; return ;;
+        '') ;;                      # unset → decide below
+        *)  _LANG="en"; return ;;
+    esac
+    # ET_LANG unset: the zh build forces zh; the en build auto-detects from locale
+    if [ "$ET_LANG_DEFAULT" = "zh" ]; then _LANG="zh"; return; fi
+    case "${LC_ALL:-}${LC_MESSAGES:-}${LANG:-}" in
+        *zh*|*ZH*) _LANG="zh" ;;
+        *)         _LANG="en" ;;
+    esac
+}
+_detect_lang
+t() { [ "$_LANG" = "zh" ] && printf '%s' "$2" || printf '%s' "$1"; }
 
 # ==============================================================================
 #  Colors & output (tty detection; falls back to no color when not a terminal)
@@ -121,8 +183,8 @@ section() {
 # ==============================================================================
 _log() {
     local level="$1"; shift
-    printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" \
-        >> "$LOG_FILE" 2>/dev/null || true
+    # subshell so a failed redirect (e.g. LOG_FILE dir missing) is swallowed, not printed by the shell
+    ( printf '[%s] [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$level" "$*" >> "$LOG_FILE" ) 2>/dev/null || true
 }
 
 # ==============================================================================
@@ -138,20 +200,18 @@ _log() {
 #       · a checkpoint / the end finding a pending interrupt → delete the uncommitted temp file, exit safely;
 #       · the target file is replaced only via an atomic mv rename — at any instant it is either the old or the new complete version,
 #         never truncated or missing — so Ctrl+C inside a section can discard the current op and exit at any time.
-#
-#  Note: the old trap pointed INT at _cleanup without exiting — Ctrl+C only silently deleted
-#        the temp dir and the script kept running, i.e. you could not interrupt. This now truly exits safely.
 # ==============================================================================
 _cleanup() {
     rm -rf "$TMP_DIR" 2>/dev/null || true
-    # fallback cleanup of atomic-write temp files (the normal path already removes/renames them)
-    rm -f /etc/easytier/*.tmp.[0-9]*      /usr/bin/*.tmp.[0-9]* \
-          /etc/init.d/*.tmp.[0-9]*        /etc/systemd/system/*.tmp.[0-9]* 2>/dev/null || true
+    # fallback cleanup of THIS run's atomic-write temp files only (named *.tmp.$$),
+    # so a concurrent instance's in-flight temp files are never clobbered
+    rm -f /etc/easytier/*.tmp.$$      /usr/bin/*.tmp.$$ \
+          /etc/init.d/*.tmp.$$        /etc/systemd/system/*.tmp.$$ 2>/dev/null || true
 }
 
 _on_signal() {
     printf '\n'
-    msg_warn "Interrupt received, exiting safely…"
+    msg_warn "$(t "Interrupt received, exiting safely…" "收到中断信号，正在安全退出…")"
     exit 130     # triggers the EXIT trap for cleanup
 }
 
@@ -170,7 +230,7 @@ crit_ck() {
     [ "$#" -gt 0 ] && rm -f "$@" 2>/dev/null
     trap '_on_signal' INT TERM HUP
     printf '\n'
-    msg_warn "Interrupted as requested; uncommitted changes discarded, exiting safely"
+    msg_warn "$(t "Interrupted as requested; uncommitted changes discarded, exiting safely" "已按请求中断，未提交的改动已丢弃，安全退出")"
     exit 130
 }
 
@@ -179,7 +239,7 @@ crit_end() {
     trap '_on_signal' INT TERM HUP
     if [ "$_SIG_PENDING" = "1" ]; then
         printf '\n'
-        msg_warn "Current operation completed; exiting safely as requested"
+        msg_warn "$(t "Current operation completed; exiting safely as requested" "当前操作已完成，按您的请求安全退出")"
         exit 130
     fi
     return 0
@@ -204,16 +264,16 @@ check_deps() {
     done
     [ -z "$missing" ] && return 0
 
-    msg_err "Missing dependencies:${missing}"
+    msg_err "$(t "Missing dependencies:${missing}" "缺少依赖:${missing}")"
     case "$OS_TYPE" in
         openwrt) msg_info "opkg update && opkg install${missing}" ;;
         alpine)  msg_info "apk add${missing}" ;;
         debian)  msg_info "apt-get install -y${missing}" ;;
         rhel)    msg_info "dnf install -y${missing}" ;;
         arch)    msg_info "pacman -S${missing}" ;;
-        *)       msg_info "Install via your system package manager:${missing}" ;;
+        *)       msg_info "$(t "Install via your system package manager:${missing}" "请通过系统包管理器安装:${missing}")" ;;
     esac
-    die "Please install the missing dependencies and re-run"
+    die "$(t "Please install the missing dependencies and re-run" "请先安装缺少的依赖后重新运行")"
 }
 
 # ==============================================================================
@@ -249,7 +309,7 @@ detect_system() {
         riscv64)        ARCH_NAME="riscv64" ;;
         *)
             ARCH_NAME="unknown"
-            msg_warn "Unrecognized arch: $(uname -m); EasyTier may not support this platform"
+            msg_warn "$(t "Unrecognized arch: $(uname -m); EasyTier may not support this platform" "未识别架构: $(uname -m)，EasyTier 可能不支持此平台")"
             ;;
     esac
 
@@ -285,21 +345,33 @@ _kill_bin() {
     return 0
 }
 
+# Run easytier-cli <args…> with a short timeout (avoids hanging if the RPC portal is down).
+# Prints stdout only; caller decides what to do with empty output.
+_cli() {
+    [ -x /usr/bin/easytier-cli ] || return 1
+    if command -v timeout > /dev/null 2>&1; then
+        timeout 5 /usr/bin/easytier-cli "$@" 2>/dev/null
+    else
+        /usr/bin/easytier-cli "$@" 2>/dev/null
+    fi
+}
+
 check_proc() {
     local bin="$1" label="${2:-$1}"
     sleep 2
     if _proc_running "$bin"; then
-        msg_ok "${label} running (PID: $(_proc_pid "$bin"))"
+        local pid; pid=$(_proc_pid "$bin")
+        msg_ok "$(t "${label} running (PID: ${pid})" "${label} 运行中 (PID: ${pid})")"
         return 0
     fi
-    msg_warn "${label} process not detected; check the logs"
+    msg_warn "$(t "${label} process not detected; check the logs" "${label} 未检测到进程，请查看日志")"
     return 1
 }
 
 # Poll for port readiness: prefer nc, fall back to /proc/net/tcp
 wait_for_port() {
     local port="$1" timeout="${2:-12}" i=0
-    printf "    Waiting for port %s" "$port"
+    printf "$(t "    Waiting for port %s" "    等待端口 %s 就绪")" "$port"
     while [ "$i" -lt "$timeout" ]; do
         if command -v nc > /dev/null 2>&1; then
             nc -z 127.0.0.1 "$port" 2>/dev/null && \
@@ -313,8 +385,8 @@ wait_for_port() {
         sleep 1
         i=$((i + 1))
     done
-    printf " ${C_YLW}(timeout)${C_RST}\n"
-    msg_warn "Port ${port} not ready; check the logs"
+    printf " ${C_YLW}$(t "(timeout)" "(超时)")${C_RST}\n"
+    msg_warn "$(t "Port ${port} not ready; check the logs" "端口 ${port} 未就绪，请检查日志")"
     return 1
 }
 
@@ -335,6 +407,18 @@ is_valid_url() {
     printf '%s' "$1" | grep -qE '^(tcp|udp|ws|wss)://'
 }
 
+# Yes/No prompt with a default. $1 prompt  $2 default(y|n) → return 0 = yes, 1 = no
+_ask_flag() {
+    printf '%s' "$1"
+    local a; read -r a
+    [ -z "$a" ] && a="$2"
+    case "$a" in
+        y|Y) return 0 ;;
+        n|N) return 1 ;;
+        *)   [ "$2" = "y" ] && return 0 || return 1 ;;
+    esac
+}
+
 # Return free space (MB) of the filesystem holding the path; empty on failure
 # Uses POSIX df -kP (supported on OpenWrt busybox / Alpine; -P avoids device-name wrap breaking columns)
 _avail_mb() {
@@ -348,11 +432,11 @@ _check_space() {
     local have; have=$(_avail_mb "$path")
     [ -z "$have" ] && return 0          # df failed: skip the check rather than block
     [ "$have" -ge "$need" ] && return 0
-    msg_warn "${label} low on space: ${have}MB free / ~${need}MB needed"
+    msg_warn "$(t "${label} low on space: ${have}MB free / ~${need}MB needed" "${label} 空间不足: 可用 ${have}MB / 需要约 ${need}MB")"
     if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
-        die "${label} out of space; refusing to continue in non-interactive mode"
+        die "$(t "${label} out of space; refusing to continue in non-interactive mode" "${label} 空间不足，非交互模式拒绝继续")"
     fi
-    printf "  Continue anyway? [y/N]: "
+    printf '%s' "$(t "  Continue anyway? [y/N]: " "  仍要继续? [y/N]: ")"
     local a; read -r a
     case "$a" in y|Y) return 0 ;; *) return 1 ;; esac
 }
@@ -374,7 +458,7 @@ gen_secret() {
         done
         s=$(printf '%s' "$s" | head -c 64)
         # send the warning to stderr so it isn't captured with the secret by $(gen_secret)
-        msg_warn "Cannot read /dev/urandom; secret is weak, replace it manually before production" >&2
+        msg_warn "$(t "Cannot read /dev/urandom; secret is weak, replace it manually before production" "无法读取 /dev/urandom，密钥强度较低，建议上线前手动替换")" >&2
     fi
     printf '%s\n' "$s"
 }
@@ -440,10 +524,9 @@ svc_remove_web()  { _svc_remove  easytier-web; }
 
 # ==============================================================================
 #  Service file writer — core
-# 
 # ==============================================================================
 svc_write_core() {
-    [ -f /etc/easytier/core.args ] || { msg_err "core.args not found"; return 1; }
+    [ -f /etc/easytier/core.args ] || { msg_err "$(t "core.args not found" "core.args 不存在")"; return 1; }
 
     # systemd / openrc need the multi-line args merged into a single line
     local args_line
@@ -451,7 +534,7 @@ svc_write_core() {
 
     # normalize unknown init to systemd up front, to avoid recursing inside the critical section
     case "$INIT_SYS" in procd|systemd|openrc) ;;
-        *) msg_warn "Unknown init system; writing systemd format, adjust manually"; INIT_SYS="systemd" ;;
+        *) msg_warn "$(t "Unknown init system; writing systemd format, adjust manually" "未知 init 系统，按 systemd 格式写入，请手动调整")"; INIT_SYS="systemd" ;;
     esac
 
     crit_begin   # critical section: atomic write of the service file (interruptible, never truncated)
@@ -501,6 +584,14 @@ RestartSec=5
 LimitNOFILE=65535
 StandardOutput=journal
 StandardError=journal
+# Hardening — kept conservative so TUN creation, routing and forwarding still work
+# (deliberately NOT setting ProtectKernelTunables/Modules or a CapabilityBoundingSet).
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+RestrictSUIDSGID=true
+ReadWritePaths=${ET_FILE_LOG_DIR}
 
 [Install]
 WantedBy=multi-user.target
@@ -524,21 +615,21 @@ EOF
             ;;
     esac
     crit_end
-    msg_ok "easytier-core service file written"
+    msg_ok "$(t "easytier-core service file written" "easytier-core 服务文件已写入")"
 }
 
 # ==============================================================================
 #  Service file writer — web-embed
 # ==============================================================================
 svc_write_web() {
-    [ -f /etc/easytier/web.args ] || { msg_err "web.args not found"; return 1; }
+    [ -f /etc/easytier/web.args ] || { msg_err "$(t "web.args not found" "web.args 不存在")"; return 1; }
 
     local args_line
     args_line=$(tr '\n' ' ' < /etc/easytier/web.args | sed 's/[[:space:]]*$//')
 
     # normalize unknown init to systemd up front, to avoid recursing inside the critical section
     case "$INIT_SYS" in procd|systemd|openrc) ;;
-        *) msg_warn "Unknown init system; writing systemd format"; INIT_SYS="systemd" ;;
+        *) msg_warn "$(t "Unknown init system; writing systemd format" "未知 init 系统，按 systemd 格式写入")"; INIT_SYS="systemd" ;;
     esac
 
     crit_begin   # critical section: atomic write of the service file
@@ -581,6 +672,9 @@ RestartSec=5
 LimitNOFILE=65535
 StandardOutput=journal
 StandardError=journal
+# Minimal hardening — kept light so account/data persistence (storage path unknown) is not broken
+NoNewPrivileges=true
+RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target
@@ -604,35 +698,106 @@ EOF
             ;;
     esac
     crit_end
-    msg_ok "easytier-web-embed service file written"
+    msg_ok "$(t "easytier-web-embed service file written" "easytier-web-embed 服务文件已写入")"
+}
+
+# ==============================================================================
+#  GitHub access helpers — mirror / token / integrity / mtime
+# ==============================================================================
+# Portable file mtime in epoch seconds (empty on failure)
+_mtime() {
+    date -r "$1" +%s 2>/dev/null || stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
+}
+
+# Apply the ghproxy-style download mirror prefix to a full github.com URL
+_mirror_url() {
+    if [ -n "$ET_GITHUB_MIRROR" ]; then
+        printf '%s/%s' "${ET_GITHUB_MIRROR%/}" "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# Fetch a GitHub API URL; adds an auth header when a token is set. Prints body, returns curl status.
+_gh_api() {
+    if [ -n "$ET_GITHUB_TOKEN" ]; then
+        curl -sf --connect-timeout 10 \
+            -H "Authorization: Bearer $ET_GITHUB_TOKEN" \
+            -H "X-GitHub-Api-Version: 2022-11-28" "$1"
+    else
+        curl -sf --connect-timeout 10 "$1"
+    fi
+}
+
+# Verify a file's sha256 against an expected hex (case-insensitive). Skips gracefully if no tool.
+_verify_sha256() {
+    local f="$1" want="$2" got=""
+    if command -v sha256sum > /dev/null 2>&1; then
+        got=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
+    elif command -v shasum > /dev/null 2>&1; then
+        got=$(shasum -a 256 "$f" 2>/dev/null | awk '{print $1}')
+    elif command -v openssl > /dev/null 2>&1; then
+        got=$(openssl dgst -sha256 "$f" 2>/dev/null | awk '{print $NF}')
+    else
+        msg_warn "$(t "No sha256 tool available; skipping integrity check" "无 sha256 工具，跳过完整性校验")"
+        return 0
+    fi
+    if [ "$(printf '%s' "$got" | tr 'A-F' 'a-f')" = "$(printf '%s' "$want" | tr 'A-F' 'a-f')" ]; then
+        msg_ok "$(t "SHA256 verified" "SHA256 校验通过")"
+        return 0
+    fi
+    msg_err "$(t "SHA256 mismatch — expected ${want}, got ${got}" "SHA256 不匹配 — 期望 ${want}，实际 ${got}")"
+    return 1
 }
 
 # ==============================================================================
 #  Version selection
-# 
-#  Added: show release date (GitHub published_at)
+#
+#  Shows release date (GitHub published_at)
 #  Returns 0 = selected ($VER)   1 = user chose 0 to go back
 # ==============================================================================
 select_version() {
     # non-interactive mode: use the env var directly
     if [ -n "${ET_VERSION:-}" ]; then
         VER="$ET_VERSION"
-        msg_ok "Using preset version: $VER"
+        msg_ok "$(t "Using preset version: $VER" "使用预设版本: $VER")"
         return 0
     fi
 
-    section "Select version to install"
-    msg_info "Fetching release list from GitHub..."
+    section "$(t "Select version to install" "选择安装版本")"
 
-    local json
-    json=$(curl -sf --connect-timeout 10 \
-        "https://api.github.com/repos/EasyTier/EasyTier/releases?per_page=${ET_RELEASES_COUNT}") || true
+    local api_url="${ET_GITHUB_API%/}/repos/EasyTier/EasyTier/releases?per_page=${ET_RELEASES_COUNT}"
+    local cache_file="${CACHE_DIR}/releases_${ET_RELEASES_COUNT}.json"
+    local json=""
+
+    # reuse a fresh cached list to avoid hammering the API (and the 60/h anon limit)
+    if [ "$ET_CACHE_TTL" -gt 0 ] && [ -f "$cache_file" ]; then
+        local m age; m=$(_mtime "$cache_file")
+        if [ -n "$m" ]; then
+            age=$(( $(date +%s) - m ))
+            if [ "$age" -ge 0 ] && [ "$age" -lt "$ET_CACHE_TTL" ]; then
+                json=$(cat "$cache_file" 2>/dev/null)
+                [ -n "$json" ] && msg_info "$(t "Using cached release list (${age}s old)" "使用缓存的版本列表（${age}s 前）")"
+            fi
+        fi
+    fi
+
+    if [ -z "$json" ]; then
+        msg_info "$(t "Fetching release list from GitHub..." "正在从 GitHub 获取版本列表...")"
+        json=$(_gh_api "$api_url") || true
+        # cache a successful fetch for next time
+        if [ -n "$json" ] && [ "$ET_CACHE_TTL" -gt 0 ]; then
+            mkdir -p "$CACHE_DIR" 2>/dev/null && printf '%s' "$json" > "$cache_file" 2>/dev/null || true
+        fi
+    fi
 
     mkdir -p "$TMP_DIR"
     local rel_file="${TMP_DIR}/releases.txt"
 
     if [ -z "$json" ]; then
-        msg_warn "Fetch failed; falling back to built-in default ${ET_DEFAULT_VERSION}"
+        msg_warn "$(t "Failed to fetch the release list from GitHub" "从 GitHub 获取版本列表失败")"
+        [ -z "$ET_GITHUB_TOKEN" ] && msg_info "$(t "If rate-limited, set ET_GITHUB_TOKEN=<PAT>, or use ET_GITHUB_MIRROR / https_proxy for a mirror" "若被限流，可设置 ET_GITHUB_TOKEN=<PAT>，或用 ET_GITHUB_MIRROR / https_proxy 走镜像/代理")"
+        msg_warn "$(t "Falling back to built-in default ${ET_DEFAULT_VERSION}" "回退到内置默认版本 ${ET_DEFAULT_VERSION}")"
         VER="$ET_DEFAULT_VERSION"; return 0
     fi
 
@@ -687,7 +852,7 @@ select_version() {
     count=$(wc -l < "$rel_file" | tr -d ' \t')
 
     if [ "$count" -eq 0 ]; then
-        msg_warn "Parse failed; falling back to built-in default ${ET_DEFAULT_VERSION}"
+        msg_warn "$(t "Parse failed; falling back to built-in default ${ET_DEFAULT_VERSION}" "解析失败，回退到内置默认版本 ${ET_DEFAULT_VERSION}")"
         VER="$ET_DEFAULT_VERSION"; return 0
     fi
 
@@ -695,40 +860,34 @@ select_version() {
     if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
         VER=$(sed -n '1p' "$rel_file" | awk '{print $1}')
         [ -z "$VER" ] && VER="$ET_DEFAULT_VERSION"
-        msg_ok "Non-interactive: using latest version ${VER}"
+        msg_ok "$(t "Non-interactive: using latest version ${VER}" "非交互：使用最新版本 ${VER}")"
         return 0
     fi
 
     while true; do
         # header (all ASCII, strictly aligned with the %-16s %-14s columns of the data rows below)
         printf "  ${C_BLD}%4s  %-16s  %-14s  %s${C_RST}\n" \
-            "No." "Version" "Type" "Date"
+            "No." "Version" "$(t "Type" "类型")" "$(t "Date" "日期")"
         printf "  %s\n" \
             "────────────────────────────────────────────────────"
 
-        local i=1
-        while [ "$i" -le "$count" ]; do
-            local line tag pre date label clr
-            line=$(sed -n "${i}p" "$rel_file")
-            tag=$(printf '%s' "$line" | awk '{print $1}')
-            pre=$(printf '%s' "$line" | awk '{print $2}')
-            date=$(printf '%s' "$line" | awk '{print $3}')
-
+        # single pass over the file (fields are "tag pre date" per line)
+        local i=0 tag pre date label clr
+        while read -r tag pre date; do
+            i=$((i + 1))
             if [ "$pre" = "stable" ]; then
                 label="[stable]    "; clr="$C_GRN"
             else
                 label="[pre-release]"; clr="$C_YLW"
             fi
-
             printf "  ${C_BLD}%3d)${C_RST}  %-16s  ${clr}%-14s${C_RST}  ${C_DIM}%s${C_RST}\n" \
                 "$i" "$tag" "$label" "$date"
-            i=$((i + 1))
-        done
+        done < "$rel_file"
 
-        printf "  ${C_BLD}%3s)${C_RST}  Back\n" "0"
+        printf "  ${C_BLD}%3s)${C_RST}  $(t "Back" "返回")\n" "0"
         printf "  %s\n" \
             "────────────────────────────────────────────────────"
-        printf "  Select [0-%d, default 1]: " "$count"
+        printf "$(t "  Select [0-%d, default 1]: " "  选择 [0-%d，默认 1]: ")" "$count"
         read -r vc
 
         [ "$vc" = "0" ] && return 1
@@ -744,10 +903,10 @@ select_version() {
             VER=$(printf '%s' "$chosen_line" | awk '{print $1}')
             local chosen_date
             chosen_date=$(printf '%s' "$chosen_line" | awk '{print $3}')
-            msg_ok "Selected: ${VER}  (released ${chosen_date})"
+            msg_ok "$(t "Selected: ${VER}  (released ${chosen_date})" "已选择: ${VER}  (发布于 ${chosen_date})")"
             return 0
         fi
-        msg_warn "Invalid input, please choose again"
+        msg_warn "$(t "Invalid input, please choose again" "无效输入，请重新选择")"
     done
 }
 
@@ -758,44 +917,59 @@ do_download() {
     local ver="$1" arch="$2"
 
     [ "$arch" = "unknown" ] && \
-        die "Unrecognized arch $(uname -m); download manually from https://github.com/EasyTier/EasyTier/releases"
+        die "$(t "Unrecognized arch $(uname -m); download manually from https://github.com/EasyTier/EasyTier/releases" "无法识别架构 $(uname -m)，请访问 https://github.com/EasyTier/EasyTier/releases 手动下载")"
 
     local zip_name="easytier-linux-${arch}-${ver}.zip"
     local url="https://github.com/EasyTier/EasyTier/releases/download/${ver}/${zip_name}"
+    local dl_url; dl_url=$(_mirror_url "$url")
+    local zip_path="${TMP_DIR}/${zip_name}"
 
-    section "Download EasyTier"
-    msg_info "Version: ${ver}  Arch: ${arch}"
-    msg_info "URL:  ${url}"
+    section "$(t "Download EasyTier" "下载 EasyTier")"
+    msg_info "$(t "Version: ${ver}  Arch: ${arch}" "版本: ${ver}  架构: ${arch}")"
+    msg_info "URL:  ${dl_url}"
+    [ -n "$ET_GITHUB_MIRROR" ] && msg_info "$(t "(via mirror ${ET_GITHUB_MIRROR})" "(经镜像 ${ET_GITHUB_MIRROR})")"
 
     # /tmp must hold at least the zip (~30MB) + extracted contents (~80MB)
-    _check_space "/tmp" 120 "/tmp (download + extract)" || return 1
+    _check_space "/tmp" "$ET_MIN_TMP_MB" "$(t "/tmp (download + extract)" "/tmp (下载 + 解压)")" || return 1
 
     mkdir -p "$TMP_DIR"
     if ! curl -L --progress-bar --retry 3 --retry-delay 3 --connect-timeout 15 \
-            -o "${TMP_DIR}/${zip_name}" "$url"; then
-        msg_err "Download failed; check your network or the version number"
+            -o "$zip_path" "$dl_url"; then
+        msg_err "$(t "Download failed; check your network or the version number" "下载失败，请检查网络连接或版本号")"
+        [ -n "$ET_GITHUB_MIRROR" ] && msg_info "$(t "The mirror may be down; try without ET_GITHUB_MIRROR or a different one" "镜像可能不可用；可去掉 ET_GITHUB_MIRROR 或换一个")"
         return 1
     fi
 
-    msg_info "Extracting..."
-    if ! unzip -o "${TMP_DIR}/${zip_name}" -d "${TMP_DIR}/"; then
-        msg_err "Extraction failed"
+    # sanity: a mirror/proxy error page is HTML, not a zip — real zips start with the "PK" magic
+    if [ "$(dd if="$zip_path" bs=2 count=1 2>/dev/null)" != "PK" ]; then
+        msg_err "$(t "Downloaded file is not a valid zip (mirror/proxy returned an error page?)" "下载文件不是有效 zip（镜像/代理返回了错误页？）")"
+        return 1
+    fi
+
+    # optional integrity check against a caller-provided sha256
+    if [ -n "$ET_SHA256" ]; then
+        _verify_sha256 "$zip_path" "$ET_SHA256" || return 1
+    fi
+
+    msg_info "$(t "Extracting..." "解压中...")"
+    if ! unzip -o "$zip_path" -d "${TMP_DIR}/"; then
+        msg_err "$(t "Extraction failed" "解压失败")"
         case "$OS_TYPE" in
-            openwrt) msg_info "First run: opkg install unzip" ;;
-            alpine)  msg_info "First run: apk add unzip" ;;
-            debian)  msg_info "First run: apt-get install -y unzip" ;;
-            rhel)    msg_info "First run: dnf install -y unzip" ;;
-            arch)    msg_info "First run: pacman -S unzip" ;;
+            openwrt) msg_info "$(t "First run: opkg install unzip" "请先: opkg install unzip")" ;;
+            alpine)  msg_info "$(t "First run: apk add unzip" "请先: apk add unzip")" ;;
+            debian)  msg_info "$(t "First run: apt-get install -y unzip" "请先: apt-get install -y unzip")" ;;
+            rhel)    msg_info "$(t "First run: dnf install -y unzip" "请先: dnf install -y unzip")" ;;
+            arch)    msg_info "$(t "First run: pacman -S unzip" "请先: pacman -S unzip")" ;;
         esac
         return 1
     fi
 
     local core_path
     core_path=$(find "$TMP_DIR" -maxdepth 2 -name "easytier-core" -type f 2>/dev/null | head -1)
-    [ -z "$core_path" ] && { msg_err "easytier-core not found after extraction (is the version correct?)"; return 1; }
+    [ -z "$core_path" ] && { msg_err "$(t "easytier-core not found after extraction (is the version correct?)" "解压后未找到 easytier-core（版本号是否正确？）")"; return 1; }
 
     EXTRACT_DIR=$(dirname "$core_path")
-    msg_ok "Download and extraction complete"
+    msg_ok "$(t "Download and extraction complete" "下载并解压完成")"
     return 0
 }
 
@@ -805,7 +979,7 @@ do_download() {
 do_install_bins() {
     local extract_dir="$1"
 
-    msg_info "Stopping running services..."
+    msg_info "$(t "Stopping running services..." "停止运行中的服务...")"
     svc_stop; svc_stop_web
 
     local ts; ts=$(date +%s)
@@ -834,7 +1008,7 @@ do_install_bins() {
             # non-interactive: ET_BACKUP_KEEP=0 means no backup; >0 backs up and keeps that many
             [ "$ET_BACKUP_KEEP" -gt 0 ] && KEEP_BACKUP=1
         else
-            printf "  Keep old binaries as backups (.bak.<ts>)? [y/N]: "
+            printf '%s' "$(t "  Keep old binaries as backups (.bak.<ts>)? [y/N]: " "  保留旧二进制为备份 (.bak.<ts>)? [y/N]: ")"
             read -r a
             case "$a" in y|Y) KEEP_BACKUP=1 ;; esac
         fi
@@ -850,7 +1024,7 @@ do_install_bins() {
     done
     [ "$need_mb" -gt 0 ] && { _check_space "/usr/bin" "$need_mb" "/usr/bin" || return 1; }
 
-    section "Installing binaries → /usr/bin/"
+    section "$(t "Installing binaries → /usr/bin/" "安装二进制文件 → /usr/bin/")"
     # critical section (transactional): each binary is copied to a temp name on the target fs, an interruptible checkpoint, then an atomic rename.
     # on interrupt: the uncommitted current binary is discarded and the original untouched; already-committed ones stay intact.
     crit_begin
@@ -870,22 +1044,22 @@ do_install_bins() {
             printf "  ${C_GRN}✓${C_RST}  %-30s  %s\n" "$bin" "$size"
             installed=$((installed + 1))
         elif [ "$will_install" = "1" ]; then
-            printf "  ${C_DIM}-  %-30s  (not in this release)${C_RST}\n" "$bin"
+            printf "  ${C_DIM}-  %-30s  $(t "(not in this release)" "(此版本未包含)")${C_RST}\n" "$bin"
         else
-            printf "  ${C_DIM}-  %-30s  (skipped, installed on demand)${C_RST}\n" "$bin"
+            printf "  ${C_DIM}-  %-30s  $(t "(skipped, installed on demand)" "(跳过，按需安装)")${C_RST}\n" "$bin"
         fi
     done
     crit_end
 
-    [ "$installed" -eq 0 ] && { msg_err "No installable files found"; return 1; }
+    [ "$installed" -eq 0 ] && { msg_err "$(t "No installable files found" "未找到任何可安装文件")"; return 1; }
 
     if ! /usr/bin/easytier-core --version > /dev/null 2>&1; then
-        msg_err "easytier-core failed to run (incompatible architecture?)"
+        msg_err "$(t "easytier-core failed to run (incompatible architecture?)" "easytier-core 执行验证失败（架构不兼容？）")"
         return 1
     fi
 
     printf "\n"
-    msg_ok "Installed: $(/usr/bin/easytier-core --version)"
+    msg_ok "$(t "Installed: $(/usr/bin/easytier-core --version)" "安装完成: $(/usr/bin/easytier-core --version)")"
     # _prune_backups always runs: even without a new backup it trims old ones down to ET_BACKUP_KEEP
     _prune_backups
     return 0
@@ -909,12 +1083,12 @@ _install_extra_bin() {
         mv -f "$_new" "/usr/bin/$bin"
         crit_end
         local size; size=$(du -sh "/usr/bin/${bin}" 2>/dev/null | awk '{print $1}')
-        msg_ok "Installed on demand: ${bin}${size:+ ($size)}"
+        msg_ok "$(t "Installed on demand: ${bin}${size:+ ($size)}" "按需安装 ${bin}${size:+ ($size)}")"
         return 0
     fi
     [ -f "/usr/bin/$bin" ] && return 0
-    msg_warn "${bin} is not in the downloaded archive and is not installed"
-    msg_info "First choose '6) Update / reinstall' in the main menu to fetch the full archive for this version"
+    msg_warn "$(t "${bin} is not in the downloaded archive and is not installed" "${bin} 不在已下载的压缩包中，且未安装")"
+    msg_info "$(t "First choose '6) Update / reinstall' in the main menu to fetch the full archive for this version" "请先在主菜单选「6) 更新 / 重装」获取此版本完整压缩包")"
     return 1
 }
 
@@ -930,15 +1104,15 @@ _prune_glob() {
     ls -t $pat 2>/dev/null | tail -n "$del" | \
         while read -r f; do
             rm -f "$f"
-            msg_info "Removing old ${label}: $(basename "$f")"
+            msg_info "$(t "Removing old ${label}: $(basename "$f")" "清理旧${label}: $(basename "$f")")"
         done
 }
 
 _prune_backups() {
     for bin in $ET_ALL_BINS; do
-        _prune_glob "/usr/bin/${bin}.bak.*" "binary backup"
+        _prune_glob "/usr/bin/${bin}.bak.*" "$(t "binary backup" "二进制备份")"
     done
-    _prune_glob "/etc/easytier/config.toml.bak.*" "config backup"
+    _prune_glob "/etc/easytier/config.toml.bak.*" "$(t "config backup" "配置备份")"
 }
 
 # ==============================================================================
@@ -967,50 +1141,76 @@ _write_core_args() {
 
 # ==============================================================================
 #  TOML config wizard
-#
 # ==============================================================================
 _toml_wizard() {
-    section "TOML config wizard"
+    section "$(t "TOML config wizard" "TOML 配置向导")"
 
     # ── Node instance name ────────────────────────────────────
     local def_name
     def_name="${ET_INSTANCE_NAME:-$(hostname 2>/dev/null || echo "easytier-node")}"
-    printf "  Node instance name  [default: %s]: " "$def_name"
+    printf "$(t "  Node instance name  [default: %s]: " "  节点实例名  [默认: %s]: ")" "$def_name"
     [ "${ET_NONINTERACTIVE:-0}" = "1" ] && printf '\n' && _TOML_INSTANCE="$def_name" || {
         read -r _TOML_INSTANCE
         [ -z "$_TOML_INSTANCE" ] && _TOML_INSTANCE="$def_name"
     }
 
-    # ── Virtual IP ───────────────────────────────────────
-    local def_ip="${ET_VIRTUAL_IP:-}"
-    while true; do
-        printf "  Virtual IPv4   [e.g. 10.0.0.1/24]: "
-        if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
-            [ -n "$def_ip" ] || die "Non-interactive mode requires ET_VIRTUAL_IP (e.g. 10.0.0.1/24)"
-            is_valid_cidr "$def_ip" || die "Invalid ET_VIRTUAL_IP format: $def_ip"
-            printf '%s\n' "$def_ip"; _TOML_IP="$def_ip"; break
-        fi
-        read -r _TOML_IP
-        [ -z "$_TOML_IP" ] && { msg_warn "Virtual IP cannot be empty"; continue; }
-        is_valid_cidr "$_TOML_IP" && break
-        msg_warn "Invalid format; enter a.b.c.d/n (e.g. 10.0.0.1/24)"
-    done
+    # ── DHCP vs fixed virtual IP ──────────────────────────
+    _TOML_DHCP="${ET_DHCP:-0}"
+    if [ "${ET_NONINTERACTIVE:-0}" != "1" ]; then
+        _ask_flag "$(t "  Auto-assign the virtual IP via DHCP? [y/N]: " "  用 DHCP 自动分配虚拟 IP? [y/N]: ")" n \
+            && _TOML_DHCP=1 || _TOML_DHCP=0
+    fi
+
+    # ── Fixed virtual IP (only when DHCP is off) ──────────
+    if [ "$_TOML_DHCP" != "1" ]; then
+        local def_ip="${ET_VIRTUAL_IP:-}"
+        while true; do
+            printf '%s' "$(t "  Virtual IPv4   [e.g. 10.0.0.1/24]: " "  虚拟 IPv4   [例: 10.0.0.1/24]: ")"
+            if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
+                [ -n "$def_ip" ] || die "$(t "Non-interactive mode requires ET_VIRTUAL_IP (or ET_DHCP=1)" "非交互模式需设置 ET_VIRTUAL_IP（或 ET_DHCP=1）")"
+                is_valid_cidr "$def_ip" || die "$(t "Invalid ET_VIRTUAL_IP format: $def_ip" "ET_VIRTUAL_IP 格式无效: $def_ip")"
+                printf '%s\n' "$def_ip"; _TOML_IP="$def_ip"; break
+            fi
+            read -r _TOML_IP
+            [ -z "$_TOML_IP" ] && { msg_warn "$(t "Virtual IP cannot be empty" "虚拟 IP 不能为空")"; continue; }
+            is_valid_cidr "$_TOML_IP" && break
+            msg_warn "$(t "Invalid format; enter a.b.c.d/n (e.g. 10.0.0.1/24)" "格式无效，请输入 a.b.c.d/n 格式（如 10.0.0.1/24）")"
+        done
+    else
+        _TOML_IP=""
+        msg_info "$(t "DHCP enabled; the fixed-IP prompt is skipped" "已启用 DHCP，跳过固定 IP")"
+    fi
+
+    # ── Listen port (base; ws/wss use +1/+2) ──────────────
+    local def_port="${ET_LISTEN_PORT:-11010}"
+    if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
+        _TOML_LISTEN_PORT="$def_port"
+    else
+        while true; do
+            printf "$(t "  Listen port    [default %s]: " "  监听端口    [默认 %s]: ")" "$def_port"
+            read -r _TOML_LISTEN_PORT
+            [ -z "$_TOML_LISTEN_PORT" ] && _TOML_LISTEN_PORT="$def_port"
+            is_valid_port "$_TOML_LISTEN_PORT" && break
+            msg_warn "$(t "Port range: 1-65535" "端口范围: 1-65535")"
+        done
+    fi
+    is_valid_port "$_TOML_LISTEN_PORT" || _TOML_LISTEN_PORT=11010
 
     # ── Network name ──────────────────────────────────────
     local def_net="${ET_NETWORK_NAME:-}"
     while true; do
-        printf "  Network name    [any string]: "
+        printf '%s' "$(t "  Network name    [any string]: " "  网络名称    [自定义字符串]: ")"
         if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
-            [ -n "$def_net" ] || die "Non-interactive mode requires ET_NETWORK_NAME"
+            [ -n "$def_net" ] || die "$(t "Non-interactive mode requires ET_NETWORK_NAME" "非交互模式需设置 ET_NETWORK_NAME")"
             printf '%s\n' "$def_net"; _TOML_NET_NAME="$def_net"; break
         fi
         read -r _TOML_NET_NAME
         [ -n "$_TOML_NET_NAME" ] && break
-        msg_warn "Network name cannot be empty"
+        msg_warn "$(t "Network name cannot be empty" "网络名称不能为空")"
     done
 
     # ── Network secret ──────────────────────────────────────
-    printf "  Network secret    [empty = auto-generate]: "
+    printf '%s' "$(t "  Network secret    [empty = auto-generate]: " "  网络密钥    [留空=自动生成]: ")"
     if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
         printf '\n'
         _TOML_NET_SECRET="${ET_NETWORK_SECRET:-}"
@@ -1019,9 +1219,9 @@ _toml_wizard() {
     fi
     if [ -z "$_TOML_NET_SECRET" ]; then
         _TOML_NET_SECRET=$(gen_secret)
-        msg_ok "Generated a random secret"
+        msg_ok "$(t "Generated a random secret" "已生成随机密钥")"
         printf "    ${C_DIM}%s${C_RST}\n" "$_TOML_NET_SECRET"
-        msg_info "Record this secret — all nodes in the same network must use the same secret"
+        msg_info "$(t "Record this secret — all nodes in the same network must use the same secret" "请记录此密钥——同一网络中所有节点需使用相同密钥")"
     fi
 
     # ── Peer list ─────────────────────────────────────
@@ -1030,28 +1230,59 @@ _toml_wizard() {
         # env var is comma-separated → convert to space-separated
         _TOML_PEERS=$(printf '%s' "$ET_PEERS" | tr ',' ' ')
     else
-        msg_info "Enter peer addresses (optional, blank line to finish)"
-        msg_info "Format: tcp://host:11010  or  udp://host:11010"
+        msg_info "$(t "Enter peer addresses (optional, blank line to finish)" "输入 Peer 地址（可选，空行结束）")"
+        msg_info "$(t "Format: tcp://host:11010  or  udp://host:11010" "格式: tcp://host:11010  或  udp://host:11010")"
         while true; do
-            printf "  Peer URL (blank line to finish): "
+            printf '%s' "$(t "  Peer URL (blank line to finish): " "  Peer URL（空行完成）: ")"
             local peer; read -r peer
             [ -z "$peer" ] && break
             if ! is_valid_url "$peer"; then
-                msg_warn "Protocol must be tcp/udp/ws/wss, try again"
+                msg_warn "$(t "Protocol must be tcp/udp/ws/wss, try again" "协议须为 tcp/udp/ws/wss，请重新输入")"
                 continue
             fi
             _TOML_PEERS="${_TOML_PEERS}${_TOML_PEERS:+ }${peer}"
         done
     fi
 
-    # ── Subnet proxy ──────────────────────────────────────
-    _TOML_PROXY_CIDR="${ET_PROXY_CIDR:-}"
-    if [ -z "$_TOML_PROXY_CIDR" ] && [ "${ET_NONINTERACTIVE:-0}" != "1" ]; then
-        printf "  Subnet proxy CIDR [optional, e.g. 192.168.1.0/24]: "
-        read -r _TOML_PROXY_CIDR
-        if [ -n "$_TOML_PROXY_CIDR" ] && ! is_valid_cidr "$_TOML_PROXY_CIDR"; then
-            msg_warn "Invalid CIDR format; subnet proxy ignored"
-            _TOML_PROXY_CIDR=""
+    # ── Subnet proxy (multiple CIDRs allowed) ─────────────
+    _TOML_PROXY_CIDRS=""
+    if [ -n "${ET_PROXY_CIDR:-}" ]; then
+        # env var: comma-separated list → validate each
+        local _c
+        for _c in $(printf '%s' "$ET_PROXY_CIDR" | tr ',' ' '); do
+            if is_valid_cidr "$_c"; then
+                _TOML_PROXY_CIDRS="${_TOML_PROXY_CIDRS}${_TOML_PROXY_CIDRS:+ }$_c"
+            else
+                msg_warn "$(t "Ignoring invalid proxy CIDR: $_c" "忽略无效子网代理 CIDR: $_c")"
+            fi
+        done
+    elif [ "${ET_NONINTERACTIVE:-0}" != "1" ]; then
+        msg_info "$(t "Subnet proxy CIDRs (optional, blank line to finish)" "子网代理 CIDR（可选，空行结束）")"
+        while true; do
+            printf '%s' "$(t "  Subnet proxy CIDR [e.g. 192.168.1.0/24]: " "  子网代理 CIDR [例: 192.168.1.0/24]: ")"
+            local _c; read -r _c
+            [ -z "$_c" ] && break
+            if is_valid_cidr "$_c"; then
+                _TOML_PROXY_CIDRS="${_TOML_PROXY_CIDRS}${_TOML_PROXY_CIDRS:+ }$_c"
+            else
+                msg_warn "$(t "Invalid CIDR format, try again" "CIDR 格式无效，请重试")"
+            fi
+        done
+    fi
+
+    # ── Advanced options (device name + key flags) ────────
+    _TOML_DEV_NAME="${ET_DEV_NAME:-easytier0}"
+    _TOML_ENC="true"; _TOML_PRIVATE="true"; _TOML_EXITNODE="true"; _TOML_COMPRESS="2"
+    if [ "${ET_NONINTERACTIVE:-0}" != "1" ]; then
+        if _ask_flag "$(t "  Configure advanced options (device name, encryption…)? [y/N]: " "  配置高级选项（设备名、加密…）? [y/N]: ")" n; then
+            printf "$(t "  TUN device name [default %s]: " "  TUN 设备名 [默认 %s]: ")" "$_TOML_DEV_NAME"
+            local _dn; read -r _dn; [ -n "$_dn" ] && _TOML_DEV_NAME="$_dn"
+            _ask_flag "$(t "  Enable encryption? [Y/n]: " "  启用加密? [Y/n]: ")" y \
+                && _TOML_ENC=true || _TOML_ENC=false
+            _ask_flag "$(t "  Private mode (reject foreign networks)? [Y/n]: " "  私有模式（拒绝陌生网络）? [Y/n]: ")" y \
+                && _TOML_PRIVATE=true || _TOML_PRIVATE=false
+            _ask_flag "$(t "  Allow acting as an exit node? [Y/n]: " "  允许作为出口节点? [Y/n]: ")" y \
+                && _TOML_EXITNODE=true || _TOML_EXITNODE=false
         fi
     fi
 }
@@ -1059,17 +1290,25 @@ _toml_wizard() {
 _toml_write_config() {
     local cfg="/etc/easytier/config.toml"
     local _tmp="${cfg}.tmp.$$"
+    local p="$_TOML_LISTEN_PORT" p1 p2
+    p1=$((p + 1)); p2=$((p + 2))
 
     crit_begin
     {
         printf 'instance_name = "%s"\n'  "$_TOML_INSTANCE"
         printf 'hostname = "%s"\n'       "$_TOML_INSTANCE"
-        printf 'dhcp = false\n'
-        printf 'ipv4 = "%s"\n'           "$_TOML_IP"
-        printf 'listeners = ["tcp://0.0.0.0:11010", "udp://0.0.0.0:11010", '
-        printf '"wg://0.0.0.0:11011", "ws://0.0.0.0:11011/", "wss://0.0.0.0:11012/"]\n'
+        if [ "$_TOML_DHCP" = "1" ]; then
+            printf 'dhcp = true\n'
+        else
+            printf 'dhcp = false\n'
+            printf 'ipv4 = "%s"\n'       "$_TOML_IP"
+        fi
+        printf 'listeners = ["tcp://0.0.0.0:%s", "udp://0.0.0.0:%s", ' "$p" "$p"
+        printf '"wg://0.0.0.0:%s", "ws://0.0.0.0:%s/", "wss://0.0.0.0:%s/"]\n' "$p1" "$p1" "$p2"
         printf 'exit_nodes = []\n'
-        printf 'rpc_portal = "0.0.0.0:0"\n'
+        # bind the RPC portal to localhost on the CLI default port so `easytier-cli` works
+        # (status view uses it); local-only, not exposed to the network
+        printf 'rpc_portal = "127.0.0.1:15888"\n'
         printf '\n'
 
         for peer in $_TOML_PEERS; do
@@ -1078,11 +1317,11 @@ _toml_write_config() {
             printf '\n'
         done
 
-        if [ -n "$_TOML_PROXY_CIDR" ]; then
+        for cidr in $_TOML_PROXY_CIDRS; do
             printf '[[proxy_network]]\n'
-            printf 'cidr = "%s"\n' "$_TOML_PROXY_CIDR"
+            printf 'cidr = "%s"\n' "$cidr"
             printf '\n'
-        fi
+        done
 
         printf '[network_identity]\n'
         printf 'network_name = "%s"\n'   "$_TOML_NET_NAME"
@@ -1091,18 +1330,18 @@ _toml_write_config() {
 
         printf '[flags]\n'
         printf 'default_protocol = "tcp"\n'
-        printf 'dev_name = "easytier0"\n'
+        printf 'dev_name = "%s"\n'          "$_TOML_DEV_NAME"
         printf 'enable_ipv6 = true\n'
-        printf 'enable_encryption = true\n'
-        printf 'enable_exit_node = true\n'
-        printf 'data_compress_algo = 2\n'
+        printf 'enable_encryption = %s\n'   "$_TOML_ENC"
+        printf 'enable_exit_node = %s\n'    "$_TOML_EXITNODE"
+        printf 'data_compress_algo = %s\n'  "$_TOML_COMPRESS"
         printf 'use_smoltcp = true\n'
-        printf 'private_mode = true\n'
+        printf 'private_mode = %s\n'        "$_TOML_PRIVATE"
         printf 'foreign_network_whitelist = "*"\n'
     } > "$_tmp"
     _commit_tmp "$_tmp" "$cfg" 600
     crit_end
-    msg_ok "TOML config written: $cfg"
+    msg_ok "$(t "TOML config written: $cfg" "TOML 配置文件已写入: $cfg")"
 }
 
 setup_toml_config() {
@@ -1110,17 +1349,17 @@ setup_toml_config() {
 
     if [ -f /etc/easytier/config.toml ]; then
         if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
-            msg_info "Non-interactive mode: auto-backup and overwrite config"
+            msg_info "$(t "Non-interactive mode: auto-backup and overwrite config" "非交互模式：自动备份并覆盖配置")"
             cp /etc/easytier/config.toml "/etc/easytier/config.toml.bak.$(date +%s)"
-            _prune_glob "/etc/easytier/config.toml.bak.*" "config backup"
+            _prune_glob "/etc/easytier/config.toml.bak.*" "$(t "config backup" "配置备份")"
         else
-            printf "  Config already exists, overwrite? [y/N/0=back]: "
+            printf '%s' "$(t "  Config already exists, overwrite? [y/N/0=back]: " "  配置文件已存在，覆盖? [y/N/0=返回]: ")"
             read -r a
             case "$a" in
                 0)    return 1 ;;
                 y|Y)  cp /etc/easytier/config.toml "/etc/easytier/config.toml.bak.$(date +%s)"
-                      _prune_glob "/etc/easytier/config.toml.bak.*" "config backup" ;;
-                *)    msg_info "Kept the existing config"
+                      _prune_glob "/etc/easytier/config.toml.bak.*" "$(t "config backup" "配置备份")" ;;
+                *)    msg_info "$(t "Kept the existing config" "已保留原配置文件")"
                       # keep the existing file, but still update core.args to point at it
                       _write_core_args "--config-file" "/etc/easytier/config.toml"
                       return 0 ;;
@@ -1131,16 +1370,27 @@ setup_toml_config() {
     _toml_wizard
     _toml_write_config
 
+    # offer to review / hand-edit the generated config before it goes live
+    if [ "${ET_NONINTERACTIVE:-0}" != "1" ]; then
+        if _ask_flag "$(t "  Review the generated config now? [y/N]: " "  现在查看生成的配置? [y/N]: ")" n; then
+            printf '\n'; sed 's/^/    /' /etc/easytier/config.toml; printf '\n'
+        fi
+        local _ed="${EDITOR:-}"
+        [ -z "$_ed" ] && command -v vi > /dev/null 2>&1 && _ed=vi
+        if [ -n "$_ed" ] && _ask_flag "$(t "  Edit it in ${_ed} before starting? [y/N]: " "  启动前用 ${_ed} 编辑? [y/N]: ")" n; then
+            "$_ed" /etc/easytier/config.toml || true
+        fi
+    fi
+
     _write_core_args "--config-file" "/etc/easytier/config.toml"
     return 0
 }
 
 # ==============================================================================
 #  Web console configuration
-# 
 # ==============================================================================
 setup_web_console() {
-    section "Configure easytier-web-embed"
+    section "$(t "Configure easytier-web-embed" "配置 easytier-web-embed")"
 
     # install web-embed on demand (do_install_bins does not install it by default)
     _install_extra_bin easytier-web-embed || return 1
@@ -1148,41 +1398,41 @@ setup_web_console() {
     # ── API port ──────────────────────────────────────
     local api_port
     while true; do
-        printf "  Web API/frontend port   [default 11211]: "
+        printf '%s' "$(t "  Web API/frontend port   [default 11211]: " "  Web API/前端 端口   [默认 11211]: ")"
         read -r api_port
         [ -z "$api_port" ] && api_port=11211
         is_valid_port "$api_port" && break
-        msg_warn "Port range: 1-65535"
+        msg_warn "$(t "Port range: 1-65535" "端口范围: 1-65535")"
     done
 
     # ── Config-serving port ──────────────────────────────────
     local cfg_port
     while true; do
-        printf "  Config-serving port        [default 22020]: "
+        printf '%s' "$(t "  Config-serving port        [default 22020]: " "  配置下发端口        [默认 22020]: ")"
         read -r cfg_port
         [ -z "$cfg_port" ] && cfg_port=22020
         is_valid_port "$cfg_port" && break
-        msg_warn "Port range: 1-65535"
+        msg_warn "$(t "Port range: 1-65535" "端口范围: 1-65535")"
     done
 
     # ── Protocol ────────────────────────────────
     printf '\n'
-    msg_info "Config-serving protocol notes:"
-    msg_info "  udp — recommended, lowest latency"
-    msg_info "  tcp — better NAT traversal"
-    msg_info "  ws  — good behind an HTTP reverse proxy; if Cloudflare Tunnel upgrades ws to wss,"
-    msg_info "        then easytier-core should join with wss (not ws)"
-    printf "  Protocol (tcp/udp/ws) [default udp]: "
+    msg_info "$(t "Config-serving protocol notes:" "配置下发协议说明:")"
+    msg_info "$(t "  udp — recommended, lowest latency" "  udp — 推荐，延迟最低")"
+    msg_info "$(t "  tcp — better NAT traversal" "  tcp — 穿透性更好")"
+    msg_info "$(t "  ws  — good behind an HTTP reverse proxy; if Cloudflare Tunnel upgrades ws to wss," "  ws  — 适合 HTTP 反向代理；若 Cloudflare Tunnel 将 ws 升级为 wss，")"
+    msg_info "$(t "        then easytier-core should join with wss (not ws)" "        则 easytier-core 接入时协议应填 wss（而非 ws）")"
+    printf '%s' "$(t "  Protocol (tcp/udp/ws) [default udp]: " "  协议 (tcp/udp/ws) [默认 udp]: ")"
     local cfg_proto; read -r cfg_proto
     case "$cfg_proto" in tcp|udp|ws) ;; *) cfg_proto=udp ;; esac
 
     # ── API Host ────────────────────────────
     printf '\n'
-    msg_info "--api-host sets the address the web frontend uses to call the API backend:"
-    msg_info "  · local access only:      http://127.0.0.1:${api_port}"
-    msg_info "  · Cloudflare Tunnel:  https://your-domain.example.com"
-    msg_info "  (after Tunnel setup, reconfigure this via 'Web console management')"
-    printf "  API Host [default http://127.0.0.1:%s]: " "$api_port"
+    msg_info "$(t "--api-host sets the address the web frontend uses to call the API backend:" "--api-host 决定 Web 前端调用 API 后端的地址:")"
+    msg_info "$(t "  · local access only:      http://127.0.0.1:${api_port}" "  · 仅本地访问:           http://127.0.0.1:${api_port}")"
+    msg_info "$(t "  · Cloudflare Tunnel:  https://your-domain.example.com" "  · Cloudflare Tunnel:  https://your-domain.example.com")"
+    msg_info "$(t "  (after Tunnel setup, reconfigure this via 'Web console management')" "  （Tunnel 配置完成后可通过「Web 控制台管理」重新配置此项）")"
+    printf "$(t "  API Host [default http://127.0.0.1:%s]: " "  API Host [默认 http://127.0.0.1:%s]: ")" "$api_port"
     local api_host; read -r api_host
     [ -z "$api_host" ] && api_host="http://127.0.0.1:${api_port}"
 
@@ -1204,62 +1454,62 @@ setup_web_console() {
     wait_for_port "$api_port" 12
 
     printf '\n'
-    printf "  ${C_GRN}┌─ easytier-web-embed started ────────────────────────┐${C_RST}\n"
-    printf "  ${C_GRN}│${C_RST}  Web console:  http://0.0.0.0:%-6s                ${C_GRN}│${C_RST}\n" "$api_port"
-    printf "  ${C_GRN}│${C_RST}  Config push:  %-3s://0.0.0.0:%-6s                 ${C_GRN}│${C_RST}\n" "$cfg_proto" "$cfg_port"
-    printf "  ${C_GRN}│${C_RST}  Default login:  admin / user  ${C_YLW}← change now${C_RST}         ${C_GRN}│${C_RST}\n"
+    printf "$(t "  ${C_GRN}┌─ easytier-web-embed started ────────────────────────┐${C_RST}\n" "  ${C_GRN}┌─ easytier-web-embed 已启动 ────────────────────────┐${C_RST}\n")"
+    printf "$(t "  ${C_GRN}│${C_RST}  Web console:  http://0.0.0.0:%-6s                ${C_GRN}│${C_RST}\n" "  ${C_GRN}│${C_RST}  Web 控制台:  http://0.0.0.0:%-6s                 ${C_GRN}│${C_RST}\n")" "$api_port"
+    printf "$(t "  ${C_GRN}│${C_RST}  Config push:  %-3s://0.0.0.0:%-6s                 ${C_GRN}│${C_RST}\n" "  ${C_GRN}│${C_RST}  配置下发:    %-3s://0.0.0.0:%-6s                 ${C_GRN}│${C_RST}\n")" "$cfg_proto" "$cfg_port"
+    printf "$(t "  ${C_GRN}│${C_RST}  Default login:  admin / user  ${C_YLW}← change now${C_RST}         ${C_GRN}│${C_RST}\n" "  ${C_GRN}│${C_RST}  默认账户:    admin / user  ${C_YLW}← 请立即修改密码${C_RST}   ${C_GRN}│${C_RST}\n")"
     printf "  ${C_GRN}└─────────────────────────────────────────────────────┘${C_RST}\n\n"
-    msg_info "First open the console in a browser and register an account, then fill in the join URL"
+    msg_info "$(t "First open the console in a browser and register an account, then fill in the join URL" "请先在浏览器访问控制台并注册账户，再继续填写接入 URL")"
     return 0
 }
 
 ask_core_web_url() {
     local started_web="${1:-false}"
-    section "easytier-core joining the web console"
-    msg_info "Format: <protocol>://<host>:<port>/<username>"
-    msg_info "Example: udp://127.0.0.1:22020/myuser"
+    section "$(t "easytier-core joining the web console" "easytier-core 接入 Web 控制台")"
+    msg_info "$(t "Format: <protocol>://<host>:<port>/<username>" "格式: <protocol>://<host>:<port>/<username>")"
+    msg_info "$(t "Example: udp://127.0.0.1:22020/myuser" "示例: udp://127.0.0.1:22020/myuser")"
     msg_info "      wss://easytier-web.example.com/22020/myuser"
-    msg_info "Note: behind a Cloudflare Tunnel with a ws serving protocol, join with wss"
+    msg_info "$(t "Note: behind a Cloudflare Tunnel with a ws serving protocol, join with wss" "注意: 若通过 Cloudflare Tunnel 反代且下发协议为 ws，接入协议请填 wss")"
 
     # non-interactive mode
     if [ -n "${ET_WEB_URL:-}" ]; then
         if ! is_valid_url "$ET_WEB_URL"; then
-            die "Invalid ET_WEB_URL protocol (must be tcp/udp/ws/wss://): $ET_WEB_URL"
+            die "$(t "Invalid ET_WEB_URL protocol (must be tcp/udp/ws/wss://): $ET_WEB_URL" "ET_WEB_URL 协议无效（须 tcp/udp/ws/wss://）: $ET_WEB_URL")"
         fi
         _write_core_args "-w" "$ET_WEB_URL"
-        msg_ok "Join URL saved (non-interactive): $ET_WEB_URL"
+        msg_ok "$(t "Join URL saved (non-interactive): $ET_WEB_URL" "接入 URL 已保存（非交互）: $ET_WEB_URL")"
         return 0
     fi
     if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
-        die "Non-interactive web mode requires ET_WEB_URL (e.g. udp://host:22020/user)"
+        die "$(t "Non-interactive web mode requires ET_WEB_URL (e.g. udp://host:22020/user)" "非交互 web 模式需设置 ET_WEB_URL（如 udp://host:22020/user）")"
     fi
 
     while true; do
         local hint=""
-        [ "$started_web" = "true" ] && hint="/undo web-embed"
-        printf "\n  Join URL [0=back%s]: " "$hint"
+        [ "$started_web" = "true" ] && hint="$(t "/undo web-embed" "/撤销 web-embed")"
+        printf "$(t "\n  Join URL [0=back%s]: " "\n  接入 URL [0=返回%s]: ")" "$hint"
         read -r w_url
 
         case "$w_url" in
             0)
                 if [ "$started_web" = "true" ]; then
-                    msg_info "Undoing web-embed configuration..."
+                    msg_info "$(t "Undoing web-embed configuration..." "正在撤销 web-embed 配置...")"
                     svc_stop_web; svc_remove_web
                     rm -f /etc/easytier/web.args
-                    msg_ok "web-embed service undone"
+                    msg_ok "$(t "web-embed service undone" "已撤销 web-embed 服务")"
                 fi
                 return 1
                 ;;
             "")
-                msg_warn "URL cannot be empty"
+                msg_warn "$(t "URL cannot be empty" "URL 不能为空")"
                 ;;
             *)
                 if ! is_valid_url "$w_url"; then
-                    msg_warn "URL must start with tcp:// udp:// ws:// wss://"
+                    msg_warn "$(t "URL must start with tcp:// udp:// ws:// wss://" "URL 须以 tcp:// udp:// ws:// wss:// 开头")"
                     continue
                 fi
                 _write_core_args "-w" "$w_url"
-                msg_ok "Join URL saved: $w_url"
+                msg_ok "$(t "Join URL saved: $w_url" "接入 URL 已保存: $w_url")"
                 return 0
                 ;;
         esac
@@ -1281,11 +1531,11 @@ do_setup_mode() {
 
     mkdir -p /etc/easytier
     while true; do
-        section "Choose configuration method"
-        printf "  ${C_BLD}1)${C_RST}  TOML config file  —  standalone node, local management\n"
-        printf "  ${C_BLD}2)${C_RST}  Web console push —  centrally manage many nodes\n"
-        printf "  ${C_BLD}0)${C_RST}  Back\n\n"
-        printf "  Select [0-2]: "
+        section "$(t "Choose configuration method" "选择配置方式")"
+        printf "  ${C_BLD}1)${C_RST}  $(t "TOML config file  —  standalone node, local management" "TOML 配置文件  —  独立节点，本地管理")\n"
+        printf "  ${C_BLD}2)${C_RST}  $(t "Web console push —  centrally manage many nodes" "Web 控制台下发 —  集中管理多节点")\n"
+        printf "  ${C_BLD}0)${C_RST}  $(t "Back" "返回")\n\n"
+        printf '%s' "$(t "  Select [0-2]: " "  请选择 [0-2]: ")"
         read -r mode
 
         case "$mode" in
@@ -1293,11 +1543,11 @@ do_setup_mode() {
             1) setup_toml_config && return 0 ;;
             2)
                 printf '\n'
-                printf "  Run easytier-web-embed on this machine?\n"
-                printf "  ${C_BLD}1)${C_RST}  Yes, deploy the web console here\n"
-                printf "  ${C_BLD}2)${C_RST}  No, connect to an existing external console\n"
-                printf "  ${C_BLD}0)${C_RST}  Back\n"
-                printf "  Select [0-2]: "
+                printf "  $(t "Run easytier-web-embed on this machine?" "是否在本机运行 easytier-web-embed？")\n"
+                printf "  ${C_BLD}1)${C_RST}  $(t "Yes, deploy the web console here" "是，本机部署 Web 控制台")\n"
+                printf "  ${C_BLD}2)${C_RST}  $(t "No, connect to an existing external console" "否，连接至已有外部控制台")\n"
+                printf "  ${C_BLD}0)${C_RST}  $(t "Back" "返回")\n"
+                printf '%s' "$(t "  Select [0-2]: " "  请选择 [0-2]: ")"
                 read -r rw
                 case "$rw" in
                     0) continue ;;
@@ -1307,10 +1557,10 @@ do_setup_mode() {
                         ask_core_web_url "true" && return 0 || continue
                         ;;
                     2) ask_core_web_url "false" && return 0 || continue ;;
-                    *) msg_warn "Invalid input" ;;
+                    *) msg_warn "$(t "Invalid input" "无效输入")" ;;
                 esac
                 ;;
-            *) msg_warn "Invalid input" ;;
+            *) msg_warn "$(t "Invalid input" "无效输入")" ;;
         esac
     done
 }
@@ -1319,18 +1569,19 @@ do_setup_mode() {
 #  Service status view
 # ==============================================================================
 do_view_status() {
-    section "Service status"
+    section "$(t "Service status" "服务状态")"
 
     _print_svc_block() {
         local label="$1" bin="$2" args_file="$3"
         printf "  ${C_BLD}[ %s ]${C_RST}\n" "$label"
         if _proc_running "$bin"; then
-            printf "    Status: ${C_GRN}✓ running${C_RST} (PID: $(_proc_pid "$bin"))\n"
+            local pid; pid=$(_proc_pid "$bin")
+            printf "    $(t "Status" "状态"): ${C_GRN}$(t "✓ running" "✓ 运行中")${C_RST} (PID: %s)\n" "$pid"
         else
-            printf "    Status: ${C_RED}✗ stopped${C_RST}\n"
+            printf "    $(t "Status" "状态"): ${C_RED}$(t "✗ stopped" "✗ 未运行")${C_RST}\n"
         fi
         [ -f "$args_file" ] && \
-            printf "    Args: ${C_DIM}%s${C_RST}\n" "$(tr '\n' ' ' < "$args_file")"
+            printf "    $(t "Args" "参数"): ${C_DIM}%s${C_RST}\n" "$(tr '\n' ' ' < "$args_file")"
         # append a short systemd status summary (3 lines)
         if [ "$INIT_SYS" = "systemd" ]; then
             local svc_name
@@ -1344,7 +1595,28 @@ do_view_status() {
     _print_svc_block "easytier-core"      "easytier-core"      "/etc/easytier/core.args"
     _print_svc_block "easytier-web-embed" "easytier-web-embed" "/etc/easytier/web.args"
 
-    printf "  ${C_BLD}[ Log commands ]${C_RST}\n"
+    # ── Network overview via easytier-cli (peers / routes) — best-effort ──
+    if [ -x /usr/bin/easytier-cli ] && _proc_running "easytier-core"; then
+        printf "  ${C_BLD}[ $(t "Network (easytier-cli)" "网络概览 (easytier-cli)") ]${C_RST}\n"
+        local shown=0 sect out
+        for sect in peer route; do
+            out=$(_cli "$sect")
+            if [ -n "$out" ]; then
+                case "$sect" in
+                    peer)  printf "    ${C_DIM}$(t "peers:" "节点:")${C_RST}\n" ;;
+                    route) printf "    ${C_DIM}$(t "routes:" "路由:")${C_RST}\n" ;;
+                esac
+                printf '%s\n' "$out" | sed 's/^/      /'
+                shown=1
+            fi
+        done
+        if [ "$shown" = "0" ]; then
+            msg_info "$(t "easytier-cli returned nothing — RPC portal may be off (older config used rpc_portal 0); reconfigure to enable" "easytier-cli 无输出——RPC 端口可能未开（旧配置用了 rpc_portal 0）；重新配置即可启用")"
+        fi
+        printf '\n'
+    fi
+
+    printf "  ${C_BLD}[ $(t "Log commands" "日志命令") ]${C_RST}\n"
     case "$INIT_SYS" in
         procd)
             printf "    easytier-core : logread -f | grep easytier\n"
@@ -1361,7 +1633,7 @@ do_view_status() {
                 printf "    easytier-web  : tail -f /var/log/easytier-web.log\n"
             ;;
     esac
-    printf "    Install log   : %s\n" "$LOG_FILE"
+    printf "    $(t "Install log  " "安装日志     ") : %s\n" "$LOG_FILE"
 }
 
 # ==============================================================================
@@ -1369,34 +1641,34 @@ do_view_status() {
 # ==============================================================================
 do_manage_web() {
     while true; do
-        section "Web console management"
+        section "$(t "Web console management" "Web 控制台管理")"
 
         if _proc_running "easytier-web-embed"; then
             local port=""
             [ -f /etc/easytier/web.args ] && \
                 port=$(grep -A1 '^--api-server-port$' /etc/easytier/web.args 2>/dev/null \
                        | tail -1 | tr -d ' \t')
-            printf "  Status: ${C_GRN}✓ running${C_RST}${port:+  (port ${port})}\n"
+            printf "  $(t "Status" "状态"): ${C_GRN}$(t "✓ running" "✓ 运行中")${C_RST}${port:+  ($(t "port" "端口") ${port})}\n"
         else
-            printf "  Status: ${C_RED}✗ stopped${C_RST}\n"
+            printf "  $(t "Status" "状态"): ${C_RED}$(t "✗ stopped" "✗ 未运行")${C_RST}\n"
         fi
         [ -f /etc/easytier/web.args ] && \
-            printf "  Args: ${C_DIM}%s${C_RST}\n" "$(tr '\n' ' ' < /etc/easytier/web.args)"
+            printf "  $(t "Args" "参数"): ${C_DIM}%s${C_RST}\n" "$(tr '\n' ' ' < /etc/easytier/web.args)"
 
         printf '\n'
-        printf "  ${C_BLD}1)${C_RST}  Start / restart\n"
-        printf "  ${C_BLD}2)${C_RST}  Stop\n"
-        printf "  ${C_BLD}3)${C_RST}  Reconfigure (port / api-host, etc.)\n"
-        printf "  ${C_BLD}4)${C_RST}  Remove service and config\n"
-        printf "  ${C_BLD}0)${C_RST}  Back to main menu\n\n"
-        printf "  Select [0-4]: "
+        printf "  ${C_BLD}1)${C_RST}  $(t "Start / restart" "启动 / 重启")\n"
+        printf "  ${C_BLD}2)${C_RST}  $(t "Stop" "停止")\n"
+        printf "  ${C_BLD}3)${C_RST}  $(t "Reconfigure (port / api-host, etc.)" "重新配置（端口 / api-host 等）")\n"
+        printf "  ${C_BLD}4)${C_RST}  $(t "Remove service and config" "移除服务及配置")\n"
+        printf "  ${C_BLD}0)${C_RST}  $(t "Back to main menu" "返回主菜单")\n\n"
+        printf '%s' "$(t "  Select [0-4]: " "  请选择 [0-4]: ")"
         read -r wc
 
         case "$wc" in
             0) return 0 ;;
             1)
                 if [ ! -f /etc/easytier/web.args ]; then
-                    msg_warn "web.args not found; run 'Reconfigure (3)' first"
+                    msg_warn "$(t "web.args not found; run 'Reconfigure (3)' first" "未找到 web.args，请先执行「重新配置（3）」")"
                     continue
                 fi
                 svc_stop_web 2>/dev/null || true
@@ -1408,21 +1680,21 @@ do_manage_web() {
                 [ -n "$p" ] && wait_for_port "$p" 12
                 check_proc easytier-web-embed "easytier-web-embed"
                 ;;
-            2) svc_stop_web && msg_ok "Stopped" ;;
+            2) svc_stop_web && msg_ok "$(t "Stopped" "已停止")" ;;
             3) setup_web_console ;;
             4)
-                printf "  Really remove the web-embed service and config files? [y/N]: "
+                printf '%s' "$(t "  Really remove the web-embed service and config files? [y/N]: " "  确认移除 web-embed 服务及配置文件? [y/N]: ")"
                 read -r a
                 case "$a" in
                     y|Y)
                         svc_stop_web; svc_remove_web
                         rm -f /etc/easytier/web.args
-                        msg_ok "Removed"
+                        msg_ok "$(t "Removed" "已移除")"
                         ;;
-                    *) msg_info "Cancelled" ;;
+                    *) msg_info "$(t "Cancelled" "已取消")" ;;
                 esac
                 ;;
-            *) msg_warn "Invalid input" ;;
+            *) msg_warn "$(t "Invalid input" "无效输入")" ;;
         esac
     done
 }
@@ -1431,20 +1703,20 @@ do_manage_web() {
 #  File location display
 # ==============================================================================
 show_file_locations() {
-    section "Installed file locations"
+    section "$(t "Installed file locations" "已安装文件位置")"
 
-    printf "  ${C_BLD}[ Binaries ]${C_RST}  /usr/bin/\n"
+    printf "  ${C_BLD}[ $(t "Binaries" "二进制") ]${C_RST}  /usr/bin/\n"
     for bin in $ET_ALL_BINS; do
         if [ -f "/usr/bin/$bin" ]; then
             local size; size=$(du -sh "/usr/bin/$bin" 2>/dev/null | awk '{print $1}')
             printf "  ${C_GRN}✓${C_RST}  %-30s  %s\n" "$bin" "$size"
         else
-            printf "  ${C_DIM}-  %-30s  (not in this release)${C_RST}\n" "$bin"
+            printf "  ${C_DIM}-  %-30s  $(t "(not in this release)" "(此版本未包含)")${C_RST}\n" "$bin"
         fi
     done
 
     printf '\n'
-    printf "  ${C_BLD}[ Config ]${C_RST}  /etc/easytier/\n"
+    printf "  ${C_BLD}[ $(t "Config" "配置") ]${C_RST}  /etc/easytier/\n"
     local cfg_found=false
     for f in config.toml core.args web.args; do
         if [ -f "/etc/easytier/$f" ]; then
@@ -1457,10 +1729,10 @@ show_file_locations() {
             cfg_found=true
         fi
     done
-    [ "$cfg_found" = false ] && printf "  ${C_DIM}(no config files)${C_RST}\n"
+    [ "$cfg_found" = false ] && printf "  ${C_DIM}$(t "(no config files)" "(无配置文件)")${C_RST}\n"
 
     printf '\n'
-    printf "  ${C_BLD}[ Service files ]${C_RST}\n"
+    printf "  ${C_BLD}[ $(t "Service files" "服务文件") ]${C_RST}\n"
     local svc_found=false
     case "$INIT_SYS" in
         procd)
@@ -1477,10 +1749,10 @@ show_file_locations() {
                 [ -f "$f" ] && printf "  ${C_GRN}✓${C_RST}  %s\n" "$f" && svc_found=true
             done ;;
     esac
-    [ "$svc_found" = false ] && printf "  ${C_DIM}(no service files)${C_RST}\n"
+    [ "$svc_found" = false ] && printf "  ${C_DIM}$(t "(no service files)" "(无服务文件)")${C_RST}\n"
 
     printf '\n'
-    printf "  ${C_BLD}[ Backups ]${C_RST}  /usr/bin/  ${C_DIM}(keep latest %d per binary)${C_RST}\n" \
+    printf "  ${C_BLD}[ $(t "Backups" "历史备份") ]${C_RST}  /usr/bin/  ${C_DIM}$(t "(keep latest %d per binary)" "(每个二进制保留最近 %d 份)")${C_RST}\n" \
         "$ET_BACKUP_KEEP"
     local bak_list
     bak_list=$(ls /usr/bin/easytier-*.bak.* 2>/dev/null) || true
@@ -1490,25 +1762,25 @@ show_file_locations() {
             printf "  ${C_DIM}*  %-44s  %s${C_RST}\n" "$(basename "$f")" "$size"
         done
     else
-        printf "  ${C_DIM}(no backup files)${C_RST}\n"
+        printf "  ${C_DIM}$(t "(no backup files)" "(无备份文件)")${C_RST}\n"
     fi
 
     printf '\n'
-    printf "  ${C_BLD}[ Logs ]${C_RST}\n"
-    printf "  Install log: %s\n" "$LOG_FILE"
+    printf "  ${C_BLD}[ $(t "Logs" "日志") ]${C_RST}\n"
+    printf "  $(t "Install log" "安装日志"): %s\n" "$LOG_FILE"
     if [ -d "$ET_FILE_LOG_DIR" ]; then
         local cur_log_size
         cur_log_size=$(du -sh "$ET_FILE_LOG_DIR" 2>/dev/null | awk '{print $1}')
-        printf "  Core logs: %s/  ${C_DIM}(now %s, cap %dMB×%d, level %s)${C_RST}\n" \
+        printf "$(t "  Core logs: %s/  ${C_DIM}(now %s, cap %dMB×%d, level %s)${C_RST}\n" "  Core 日志: %s/  ${C_DIM}(当前 %s, 上限 %dMB×%d, 级别 %s)${C_RST}\n")" \
             "$ET_FILE_LOG_DIR" "${cur_log_size:-?}" \
             "$ET_FILE_LOG_SIZE" "$ET_FILE_LOG_COUNT" "$ET_FILE_LOG_LEVEL"
     fi
     case "$INIT_SYS" in
-        procd)   printf "  Runtime log: logread -f | grep easytier\n" ;;
-        systemd) printf "  Runtime log: journalctl -u easytier -f\n"
+        procd)   printf "  $(t "Runtime log" "运行日志"): logread -f | grep easytier\n" ;;
+        systemd) printf "  $(t "Runtime log" "运行日志"): journalctl -u easytier -f\n"
                  [ -f /etc/systemd/system/easytier-web.service ] && \
                      printf "            journalctl -u easytier-web -f\n" ;;
-        openrc)  printf "  Runtime log: tail -f /var/log/easytier.log\n" ;;
+        openrc)  printf "  $(t "Runtime log" "运行日志"): tail -f /var/log/easytier.log\n" ;;
     esac
 
     # old versions (< 2.1.0) without --file-log-dir wrote 100MB×10 logs to cwd
@@ -1516,7 +1788,7 @@ show_file_locations() {
         local legacy_size
         legacy_size=$(du -ch /easytier.log* 2>/dev/null | tail -1 | awk '{print $1}')
         printf '\n'
-        printf "  ${C_YLW}⚠  Found legacy logs /easytier.log* (%s); remove manually${C_RST}\n" \
+        printf "  ${C_YLW}$(t "⚠  Found legacy logs /easytier.log* (%s); remove manually" "⚠  发现遗留日志 /easytier.log*（%s），可手动清理")${C_RST}\n" \
             "${legacy_size:-?}"
         printf "  ${C_DIM}   rm -f /easytier.log /easytier.log.[0-9] /easytier.log.[0-9][0-9]${C_RST}\n"
     fi
@@ -1527,26 +1799,26 @@ show_file_locations() {
 # ==============================================================================
 _uninstall_one() {
     local bin="$1"
-    printf "  Really remove ${C_BLD}%s${C_RST}? [y/N]: " "$bin"
+    printf "$(t "  Really remove ${C_BLD}%s${C_RST}? [y/N]: " "  确认移除 ${C_BLD}%s${C_RST}? [y/N]: ")" "$bin"
     local a; read -r a
-    case "$a" in y|Y) ;; *) msg_info "Cancelled"; return 1 ;; esac
+    case "$a" in y|Y) ;; *) msg_info "$(t "Cancelled" "已取消")"; return 1 ;; esac
 
     case "$bin" in
         easytier-core)
-            msg_info "Stopping and removing the easytier service..."
+            msg_info "$(t "Stopping and removing the easytier service..." "停止并移除 easytier 服务...")"
             svc_stop; svc_remove
             _kill_bin easytier-core
             ip link del easytier0 2>/dev/null || true
             ;;
         easytier-web-embed)
-            msg_info "Stopping and removing the easytier-web service..."
+            msg_info "$(t "Stopping and removing the easytier-web service..." "停止并移除 easytier-web 服务...")"
             svc_stop_web; svc_remove_web
             _kill_bin easytier-web-embed
             ;;
     esac
 
     rm -f "/usr/bin/$bin"
-    msg_ok "${bin} removed"
+    msg_ok "$(t "${bin} removed" "${bin} 已移除")"
     return 0
 }
 
@@ -1554,12 +1826,12 @@ _uninstall_one() {
 #  Uninstall — everything (services/config/backups/logs/legacy logs)
 # ==============================================================================
 _uninstall_all() {
-    printf "  ${C_YLW}⚠  This removes all EasyTier services and binaries${C_RST}\n"
-    printf "  Confirm full uninstall? [y/N]: "
+    printf "  ${C_YLW}$(t "⚠  This removes all EasyTier services and binaries" "⚠  此操作将移除所有 EasyTier 相关服务和二进制")${C_RST}\n"
+    printf '%s' "$(t "  Confirm full uninstall? [y/N]: " "  确认全部卸载? [y/N]: ")"
     local a; read -r a
-    case "$a" in y|Y) ;; *) msg_info "Cancelled"; return 1 ;; esac
+    case "$a" in y|Y) ;; *) msg_info "$(t "Cancelled" "已取消")"; return 1 ;; esac
 
-    msg_info "Stopping and removing services..."
+    msg_info "$(t "Stopping and removing services..." "停止并移除服务...")"
     svc_stop; svc_stop_web
     svc_remove; svc_remove_web
     _kill_bin easytier-core
@@ -1568,37 +1840,37 @@ _uninstall_all() {
         rm -f "/usr/bin/$bin"
     done
     ip link del easytier0 2>/dev/null || true
-    msg_ok "Binaries and services removed"
+    msg_ok "$(t "Binaries and services removed" "二进制及服务已移除")"
 
     local bak_list
     bak_list=$(ls /usr/bin/easytier-*.bak.* 2>/dev/null) || true
     if [ -n "$bak_list" ]; then
         local bak_count
         bak_count=$(printf '%s\n' "$bak_list" | wc -l | tr -d ' ')
-        printf "  Delete %d backup file(s)? [y/N]: " "$bak_count"
+        printf "$(t "  Delete %d backup file(s)? [y/N]: " "  删除 %d 个历史备份文件? [y/N]: ")" "$bak_count"
         read -r a
         case "$a" in
             y|Y) printf '%s\n' "$bak_list" | while read -r f; do rm -f "$f"; done
-                 msg_ok "Backup files removed" ;;
-            *)   msg_info "Backup files kept in /usr/bin/" ;;
+                 msg_ok "$(t "Backup files removed" "备份文件已清理")" ;;
+            *)   msg_info "$(t "Backup files kept in /usr/bin/" "备份文件已保留于 /usr/bin/")" ;;
         esac
     fi
 
-    printf "  Delete config dir /etc/easytier? [y/N]: "
+    printf '%s' "$(t "  Delete config dir /etc/easytier? [y/N]: " "  删除配置目录 /etc/easytier? [y/N]: ")"
     read -r a
     case "$a" in
-        y|Y) rm -rf /etc/easytier && msg_ok "Config dir deleted" ;;
-        *)   msg_info "Config dir kept: /etc/easytier" ;;
+        y|Y) rm -rf /etc/easytier && msg_ok "$(t "Config dir deleted" "配置目录已删除")" ;;
+        *)   msg_info "$(t "Config dir kept: /etc/easytier" "配置目录已保留: /etc/easytier")" ;;
     esac
 
     if [ -d "$ET_FILE_LOG_DIR" ]; then
         local log_size
         log_size=$(du -sh "$ET_FILE_LOG_DIR" 2>/dev/null | awk '{print $1}')
-        printf "  Delete log dir %s (%s)? [y/N]: " "$ET_FILE_LOG_DIR" "${log_size:-?}"
+        printf "$(t "  Delete log dir %s (%s)? [y/N]: " "  删除日志目录 %s (%s)? [y/N]: ")" "$ET_FILE_LOG_DIR" "${log_size:-?}"
         read -r a
         case "$a" in
-            y|Y) rm -rf "$ET_FILE_LOG_DIR" && msg_ok "Log dir deleted" ;;
-            *)   msg_info "Log dir kept: $ET_FILE_LOG_DIR" ;;
+            y|Y) rm -rf "$ET_FILE_LOG_DIR" && msg_ok "$(t "Log dir deleted" "日志目录已删除")" ;;
+            *)   msg_info "$(t "Log dir kept: $ET_FILE_LOG_DIR" "日志目录已保留: $ET_FILE_LOG_DIR")" ;;
         esac
     fi
 
@@ -1607,16 +1879,16 @@ _uninstall_all() {
     legacy=$(ls /easytier.log /easytier.log.[0-9] /easytier.log.[0-9][0-9] 2>/dev/null) || true
     if [ -n "$legacy" ]; then
         local n; n=$(printf '%s\n' "$legacy" | wc -l | tr -d ' ')
-        printf "  Found %d legacy log file(s) (/easytier.log*), delete? [y/N]: " "$n"
+        printf "$(t "  Found %d legacy log file(s) (/easytier.log*), delete? [y/N]: " "  发现 %d 个遗留日志文件 (/easytier.log*)，删除? [y/N]: ")" "$n"
         read -r a
         case "$a" in
             y|Y) printf '%s\n' "$legacy" | while read -r f; do rm -f "$f"; done
-                 msg_ok "Legacy logs removed" ;;
-            *)   msg_info "Legacy logs kept" ;;
+                 msg_ok "$(t "Legacy logs removed" "遗留日志已清理")" ;;
+            *)   msg_info "$(t "Legacy logs kept" "遗留日志已保留")" ;;
         esac
     fi
 
-    msg_ok "Uninstall complete"
+    msg_ok "$(t "Uninstall complete" "卸载完成")"
     return 0
 }
 
@@ -1624,7 +1896,7 @@ _uninstall_all() {
 #  Uninstall entry — let the user pick a single binary or everything
 # ==============================================================================
 do_uninstall() {
-    section "Uninstall EasyTier"
+    section "$(t "Uninstall EasyTier" "卸载 EasyTier")"
 
     # collect the currently installed binaries
     local installed="" idx=0
@@ -1632,26 +1904,26 @@ do_uninstall() {
         [ -f "/usr/bin/$bin" ] && installed="${installed}${installed:+ }$bin"
     done
     if [ -z "$installed" ]; then
-        msg_warn "No EasyTier binaries found"
+        msg_warn "$(t "No EasyTier binaries found" "未发现任何 EasyTier 二进制")"
         return 1
     fi
 
-    printf "  Installed binaries:\n\n"
+    printf "  $(t "Installed binaries:" "已安装的二进制：")\n\n"
     idx=0
     for bin in $installed; do
         idx=$((idx + 1))
         local size; size=$(du -sh "/usr/bin/$bin" 2>/dev/null | awk '{print $1}')
         local tag=""
         case "$bin" in
-            easytier-core)      tag="  ${C_DIM}(incl. easytier service)${C_RST}" ;;
-            easytier-web-embed) tag="  ${C_DIM}(incl. easytier-web service)${C_RST}" ;;
+            easytier-core)      tag="  ${C_DIM}$(t "(incl. easytier service)" "(含 easytier 服务)")${C_RST}" ;;
+            easytier-web-embed) tag="  ${C_DIM}$(t "(incl. easytier-web service)" "(含 easytier-web 服务)")${C_RST}" ;;
         esac
         printf "  ${C_BLD}%d)${C_RST}  %-22s %s%s\n" "$idx" "$bin" "$size" "$tag"
     done
     local all_idx=$((idx + 1))
-    printf "  ${C_BLD}%d)${C_RST}  ${C_YLW}Delete all${C_RST}  ${C_DIM}(incl. services/config/backups/logs)${C_RST}\n" "$all_idx"
-    printf "  ${C_BLD}0)${C_RST}  Back\n\n"
-    printf "  Select [0-%d]: " "$all_idx"
+    printf "  ${C_BLD}%d)${C_RST}  ${C_YLW}$(t "Delete all" "全部删除")${C_RST}  ${C_DIM}$(t "(incl. services/config/backups/logs)" "(含服务/配置/备份/日志)")${C_RST}\n" "$all_idx"
+    printf "  ${C_BLD}0)${C_RST}  $(t "Back" "返回")\n\n"
+    printf "$(t "  Select [0-%d]: " "  请选择 [0-%d]: ")" "$all_idx"
     local choice; read -r choice
 
     [ "$choice" = "0" ] && return 1
@@ -1660,7 +1932,7 @@ do_uninstall() {
     # validate the numeric range
     if ! printf '%s' "$choice" | grep -qE '^[0-9]+$' || \
        [ "$choice" -lt 1 ] || [ "$choice" -gt "$idx" ]; then
-        msg_warn "Invalid choice"
+        msg_warn "$(t "Invalid choice" "无效选择")"
         return 1
     fi
 
@@ -1678,7 +1950,7 @@ do_uninstall() {
 #  Main menu
 # ==============================================================================
 _print_header() {
-    local cur="" mode_str="not configured" web_str=""
+    local cur="" mode_str="$(t "not configured" "未配置")" web_str=""
 
     [ -f /usr/bin/easytier-core ] && \
         cur=$(/usr/bin/easytier-core --version 2>&1 | awk '{print $2}' | cut -d'-' -f1)
@@ -1686,10 +1958,10 @@ _print_header() {
     if [ -f /etc/easytier/core.args ]; then
         local first; first=$(head -1 /etc/easytier/core.args)
         case "$first" in
-            --config-file) mode_str="TOML config file" ;;
+            --config-file) mode_str="$(t "TOML config file" "TOML 配置文件")" ;;
             -w)
                 local wurl; wurl=$(sed -n '2p' /etc/easytier/core.args 2>/dev/null)
-                mode_str="Web console (${wurl})"
+                mode_str="$(t "Web console (${wurl})" "Web 控制台 (${wurl})")"
                 ;;
         esac
     fi
@@ -1699,28 +1971,48 @@ _print_header() {
         [ -f /etc/easytier/web.args ] && \
             port=$(grep -A1 '^--api-server-port$' /etc/easytier/web.args 2>/dev/null \
                    | tail -1 | tr -d ' ')
-        web_str="${C_GRN}✓ running${C_RST}${port:+  (port ${port})}"
+        web_str="${C_GRN}$(t "✓ running" "✓ 运行中")${C_RST}${port:+  ($(t "port" "端口") ${port})}"
     elif [ -f /etc/easytier/web.args ]; then
-        web_str="${C_YLW}✗ configured but not running${C_RST}"
+        web_str="${C_YLW}$(t "✗ configured but not running" "✗ 已配置但未运行")${C_RST}"
     fi
 
     # separator width is content-independent, sidestepping CJK double-width alignment issues
     local SEP="${C_BLD}  ──────────────────────────────────────────${C_RST}"
     printf "\n%s\n" "$SEP"
-    printf "  ${C_BLD}  EasyTier Manager${C_RST}  v%s\n" "$SCRIPT_VERSION"
+    printf "  ${C_BLD}  $(t "EasyTier Manager" "EasyTier 管理脚本")${C_RST}  v%s\n" "$SCRIPT_VERSION"
     printf "%s\n" "$SEP"
-    # label column widths (System/Arch/Version/Config) — kept simple for alignment
-    # values follow the labels directly, no right-border alignment needed
-    printf "  System  %-12s  Arch  %s\n" "$OS_TYPE" "$ARCH_NAME"
+    printf "  $(t "System" "系统")  %-12s  $(t "Arch" "架构")  %s\n" "$OS_TYPE" "$ARCH_NAME"
     printf "  Init  %s\n" "$INIT_SYS"
     if [ -n "$cur" ]; then
-        printf "  Version  %s\n" "$cur"
-        printf "  Config   %s\n" "$mode_str"
+        printf "  $(t "Version" "版本")  %s\n" "$cur"
+        printf "  $(t "Config " "配置")  %s\n" "$mode_str"
         [ -n "$web_str" ] && printf "  Web   %s\n" "$web_str"
     else
-        printf "  ${C_YLW}Status  not installed${C_RST}\n"
+        printf "  ${C_YLW}$(t "Status  not installed" "状态  未安装")${C_RST}\n"
     fi
     printf "%s\n" "$SEP"
+}
+
+# ==============================================================================
+#  CLI usage (for the one-shot subcommands handled in main)
+# ==============================================================================
+_usage() {
+    cat <<USAGE
+$(t "EasyTier Manager" "EasyTier 管理脚本") v${SCRIPT_VERSION}
+
+$(t "Usage" "用法"): $(basename "$0") [command]
+
+$(t "Commands" "命令"):
+  (none) | menu     $(t "interactive menu (default)" "交互式菜单（默认）")
+  status            $(t "show service status and network overview" "显示服务状态与网络概览")
+  start|stop|restart
+                    $(t "control easytier-core (and web-embed if configured)" "控制 easytier-core（及已配置的 web-embed）")
+  version           $(t "print script and core version" "打印脚本与 core 版本")
+  help              $(t "this help" "本帮助")
+
+$(t "Non-interactive install: set ET_NONINTERACTIVE=1 and ET_* vars (see README)." "非交互安装：设置 ET_NONINTERACTIVE=1 及 ET_* 变量（见 README）。")
+$(t "Language: ET_LANG=en|zh (default: auto from locale)." "语言：ET_LANG=en|zh（默认：按 locale 自动识别）。")
+USAGE
 }
 
 main() {
@@ -1735,6 +2027,34 @@ main() {
         [ -z "$_u_lcount" ] && ET_FILE_LOG_COUNT=3
     fi
 
+    # ── One-shot subcommands (for scripts / cron); these don't need curl/unzip ──
+    case "${1:-}" in
+        -h|--help|help)
+            _usage; exit 0 ;;
+        -V|--version|version)
+            printf 'easytier-manager %s\n' "$SCRIPT_VERSION"
+            [ -x /usr/bin/easytier-core ] && \
+                printf 'easytier-core %s\n' "$(/usr/bin/easytier-core --version 2>&1 | awk '{print $2}')"
+            exit 0 ;;
+        status)
+            do_view_status; exit 0 ;;
+        start)
+            svc_start; check_proc easytier-core "easytier-core" || true
+            [ -f /etc/easytier/web.args ] && { svc_start_web; check_proc easytier-web-embed "easytier-web-embed" || true; }
+            exit 0 ;;
+        stop)
+            svc_stop; [ -f /etc/easytier/web.args ] && svc_stop_web
+            msg_ok "$(t "Stopped" "已停止")"; exit 0 ;;
+        restart)
+            svc_restart; check_proc easytier-core "easytier-core" || true
+            [ -f /etc/easytier/web.args ] && { svc_restart_web; check_proc easytier-web-embed "easytier-web-embed" || true; }
+            exit 0 ;;
+        ''|menu) ;;                 # fall through to interactive menu / non-interactive install
+        *)
+            msg_err "$(t "Unknown command: $1" "未知命令: $1")"
+            _usage; exit 2 ;;
+    esac
+
     check_deps
 
     _log "INFO" "Script start v${SCRIPT_VERSION} OS=${OS_TYPE} INIT=${INIT_SYS} ARCH=${ARCH_NAME} BACKUP=${ET_BACKUP_KEEP} LOG=${ET_FILE_LOG_SIZE}MB×${ET_FILE_LOG_COUNT}"
@@ -1742,12 +2062,12 @@ main() {
     # ── Non-interactive mode: do the install / update once, then exit (for CI / Ansible) ────
     # the interactive menu needs a tty; non-interactively stdin is EOF and the menu would spin, so dispatch here directly.
     if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
-        select_version                   || die "Version selection failed"
-        do_download "$VER" "$ARCH_NAME"  || die "Download failed"
-        do_install_bins "$EXTRACT_DIR"   || die "Install failed"
+        select_version                   || die "$(t "Version selection failed" "版本选择失败")"
+        do_download "$VER" "$ARCH_NAME"  || die "$(t "Download failed" "下载失败")"
+        do_install_bins "$EXTRACT_DIR"   || die "$(t "Install failed" "安装失败")"
         # if web-embed was deployed, upgrade it too to avoid version skew with core
         [ -f /etc/easytier/web.args ] && _install_extra_bin easytier-web-embed
-        do_setup_mode                    || die "Configuration failed (check ET_MODE / ET_VIRTUAL_IP / ET_WEB_URL, etc.)"
+        do_setup_mode                    || die "$(t "Configuration failed (check ET_MODE / ET_VIRTUAL_IP / ET_WEB_URL, etc.)" "配置失败（检查 ET_MODE / ET_VIRTUAL_IP / ET_WEB_URL 等）")"
         svc_write_core
         svc_stop 2>/dev/null || true
         svc_start
@@ -1764,7 +2084,7 @@ main() {
     # without this, the old service still writes 100MB×10 rolling logs to cwd (=/ on procd)
     if [ -f /etc/easytier/core.args ] && \
        ! grep -q -- "--file-log-dir" /etc/easytier/core.args; then
-        msg_warn "Detected old core.args missing log params; appending --file-log-*"
+        msg_warn "$(t "Detected old core.args missing log params; appending --file-log-*" "检测到旧版 core.args 缺少日志参数，正在追加 --file-log-*")"
         mkdir -p "$ET_FILE_LOG_DIR" 2>/dev/null || true
         _tmp="/etc/easytier/core.args.tmp.$$"
         crit_begin
@@ -1776,7 +2096,7 @@ main() {
         _commit_tmp "$_tmp" /etc/easytier/core.args 600
         crit_end
         svc_write_core 2>/dev/null || true
-        msg_info "Choose '2) Restart services' in the main menu to apply the new params"
+        msg_info "$(t "Choose '2) Restart services' in the main menu to apply the new params" "请在主菜单选「2) 重启服务」让新参数生效")"
     fi
 
     while true; do
@@ -1784,31 +2104,31 @@ main() {
 
         printf '\n'
         if [ -f /usr/bin/easytier-core ]; then
-            printf "  ${C_DIM}── Service ──${C_RST}\n"
-            printf "  ${C_BLD}1)${C_RST}  View service status\n"
-            printf "  ${C_BLD}2)${C_RST}  Restart services\n"
-            printf "  ${C_BLD}3)${C_RST}  Stop services\n"
-            printf "  ${C_DIM}── Configuration ──${C_RST}\n"
-            printf "  ${C_BLD}4)${C_RST}  Change configuration (TOML / Web mode wizard)\n"
-            printf "  ${C_BLD}5)${C_RST}  Web console management\n"
-            printf "  ${C_DIM}── Maintenance ──${C_RST}\n"
-            printf "  ${C_BLD}6)${C_RST}  Update / reinstall (choose version)\n"
-            printf "  ${C_BLD}7)${C_RST}  File locations & logs\n"
-            printf "  ${C_BLD}8)${C_RST}  Uninstall EasyTier\n"
+            printf "  ${C_DIM}── $(t "Service" "日常") ──${C_RST}\n"
+            printf "  ${C_BLD}1)${C_RST}  $(t "View service status" "查看服务状态")\n"
+            printf "  ${C_BLD}2)${C_RST}  $(t "Restart services" "重启服务")\n"
+            printf "  ${C_BLD}3)${C_RST}  $(t "Stop services" "停止服务")\n"
+            printf "  ${C_DIM}── $(t "Configuration" "配置") ──${C_RST}\n"
+            printf "  ${C_BLD}4)${C_RST}  $(t "Change configuration (TOML / Web mode wizard)" "修改配置（TOML / Web 模式向导）")\n"
+            printf "  ${C_BLD}5)${C_RST}  $(t "Web console management" "Web 控制台管理")\n"
+            printf "  ${C_DIM}── $(t "Maintenance" "安装维护") ──${C_RST}\n"
+            printf "  ${C_BLD}6)${C_RST}  $(t "Update / reinstall (choose version)" "更新 / 重装（选择版本）")\n"
+            printf "  ${C_BLD}7)${C_RST}  $(t "File locations & logs" "文件位置与日志")\n"
+            printf "  ${C_BLD}8)${C_RST}  $(t "Uninstall EasyTier" "卸载 EasyTier")\n"
             printf "\n"
-            printf "  ${C_BLD}0)${C_RST}  Exit\n"
+            printf "  ${C_BLD}0)${C_RST}  $(t "Exit" "退出")\n"
         else
-            printf "  ${C_BLD}1)${C_RST}  Install\n"
-            printf "  ${C_BLD}0)${C_RST}  Exit\n"
+            printf "  ${C_BLD}1)${C_RST}  $(t "Install" "安装")\n"
+            printf "  ${C_BLD}0)${C_RST}  $(t "Exit" "退出")\n"
         fi
         printf "  ─────────────────────────────────────────────────\n"
-        printf "  Select: "
+        printf '%s' "$(t "  Select: " "  请选择: ")"
         read -r choice
 
         # ── Not installed: only "Install" and "Exit" ──────────────────
         if [ ! -f /usr/bin/easytier-core ]; then
             case "$choice" in
-                0) printf "\n  Bye\n\n"; _log "INFO" "Script exit"; exit 0 ;;
+                0) printf "\n  $(t "Bye" "再见")\n\n"; _log "INFO" "Script exit"; exit 0 ;;
                 1)
                     select_version                   || continue
                     do_download "$VER" "$ARCH_NAME"  || continue
@@ -1818,11 +2138,11 @@ main() {
                         svc_start
                         check_proc easytier-core "easytier-core"
                     else
-                        msg_warn "Binaries installed; complete configuration later via '4) Change configuration'"
+                        msg_warn "$(t "Binaries installed; complete configuration later via '4) Change configuration'" "二进制已安装，请稍后通过主菜单「4) 修改配置」完成配置")"
                     fi
                     show_file_locations
                     ;;
-                *) msg_warn "Invalid input" ;;
+                *) msg_warn "$(t "Invalid input" "无效输入")" ;;
             esac
             continue
         fi
@@ -1830,18 +2150,18 @@ main() {
         case "$choice" in
 
             # ── Exit ────────────────────────────────────────────────
-            0) printf "\n  Bye\n\n"; _log "INFO" "Script exit"; exit 0 ;;
+            0) printf "\n  $(t "Bye" "再见")\n\n"; _log "INFO" "Script exit"; exit 0 ;;
 
             # ── Status ───────────────────────────────────────
             1) do_view_status ;;
 
             # ── Restart services ─────────────────────────────
             2)
-                msg_info "Restarting easytier-core..."
+                msg_info "$(t "Restarting easytier-core..." "重启 easytier-core...")"
                 svc_restart
                 check_proc easytier-core "easytier-core"
                 if [ -f /etc/easytier/web.args ]; then
-                    printf "  Also restart easytier-web-embed? [Y/n]: "
+                    printf '%s' "$(t "  Also restart easytier-web-embed? [Y/n]: " "  同时重启 easytier-web-embed? [Y/n]: ")"
                     read -r a
                     case "$a" in
                         n|N) ;;
@@ -1853,13 +2173,13 @@ main() {
 
             # ── Stop services ────────────────────────────────
             3)
-                msg_info "Stopping easytier-core..."
-                svc_stop && msg_ok "Stopped"
+                msg_info "$(t "Stopping easytier-core..." "停止 easytier-core...")"
+                svc_stop && msg_ok "$(t "Stopped" "已停止")"
                 if _proc_running "easytier-web-embed"; then
-                    printf "  Also stop easytier-web-embed? [y/N]: "
+                    printf '%s' "$(t "  Also stop easytier-web-embed? [y/N]: " "  同时停止 easytier-web-embed? [y/N]: ")"
                     read -r a
                     case "$a" in
-                        y|Y) svc_stop_web && msg_ok "easytier-web-embed stopped" ;;
+                        y|Y) svc_stop_web && msg_ok "$(t "easytier-web-embed stopped" "easytier-web-embed 已停止")" ;;
                         *) ;;
                     esac
                 fi
@@ -1890,13 +2210,13 @@ main() {
                       awk '{print $2}' | cut -d'-' -f1)
                 latest=$(printf '%s' "$VER" | sed 's/^v//')
 
-                section "Update method"
-                printf "  ${C_BLD}1)${C_RST}  Update binaries only (keep current config)\n"
-                printf "  ${C_BLD}2)${C_RST}  Update binaries and reconfigure\n"
+                section "$(t "Update method" "更新方式")"
+                printf "  ${C_BLD}1)${C_RST}  $(t "Update binaries only (keep current config)" "仅更新二进制（保留现有配置）")\n"
+                printf "  ${C_BLD}2)${C_RST}  $(t "Update binaries and reconfigure" "更新二进制并重新配置")\n"
                 [ "$cur" = "$latest" ] && \
-                    msg_warn "Already on ${VER}; choosing 1 reinstalls the same version"
-                printf "  ${C_BLD}0)${C_RST}  Back\n\n"
-                printf "  Select [0-2, default 1]: "
+                    msg_warn "$(t "Already on ${VER}; choosing 1 reinstalls the same version" "当前已是 ${VER}，选 1 将重装相同版本")"
+                printf "  ${C_BLD}0)${C_RST}  $(t "Back" "返回")\n\n"
+                printf '%s' "$(t "  Select [0-2, default 1]: " "  请选择 [0-2，默认 1]: ")"
                 read -r up
                 [ -z "$up" ] && up=1
 
@@ -1924,10 +2244,10 @@ main() {
                             svc_start
                             check_proc easytier-core "easytier-core"
                         else
-                            msg_warn "Configuration skipped; binaries updated but services not restarted"
+                            msg_warn "$(t "Configuration skipped; binaries updated but services not restarted" "已跳过配置，二进制已更新但服务未重启")"
                         fi
                         ;;
-                    *) msg_warn "Invalid input"; continue ;;
+                    *) msg_warn "$(t "Invalid input" "无效输入")"; continue ;;
                 esac
                 show_file_locations
                 ;;
@@ -1938,9 +2258,10 @@ main() {
             # ── Uninstall ────────────────────────────────────────────────
             8) do_uninstall || true ;;
 
-            *) msg_warn "Invalid input" ;;
+            *) msg_warn "$(t "Invalid input" "无效输入")" ;;
         esac
     done
 }
 
-main
+# Run main unless the script is sourced for testing (ET_SOURCE_ONLY=1)
+[ "${ET_SOURCE_ONLY:-0}" = "1" ] || main "$@"
