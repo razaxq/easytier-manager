@@ -10,6 +10,19 @@
 
 ---
 
+## 🌐 语言 / Language
+
+本仓库提供两个**逻辑完全一致、仅界面/注释语言不同**的脚本：
+
+| 文件 | 界面语言 | Raw URL |
+|---|---|---|
+| **`easytier.sh`**（默认 / default） | English | `.../main/easytier.sh` |
+| `easytier.zh.sh` | 简体中文 | `.../main/easytier.zh.sh` |
+
+> The default **`easytier.sh` is in English**. For a Simplified-Chinese UI, use **`easytier.zh.sh`** — the two scripts are functionally identical; pick whichever language you prefer.
+
+---
+
 ## ✨ 功能
 
 - 🎛  **交互式菜单** —— 安装 / 更新 / 配置 / 重启 / 卸载 / 查看状态，一站式完成
@@ -28,12 +41,22 @@
 
 ### 交互式安装（推荐）
 
+英文版（默认）：
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/razaxq/easytier-manager/main/easytier.sh -o easytier.sh
 sudo sh easytier.sh
 ```
 
+中文版（把文件名换成 `easytier.zh.sh` 即可）：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/razaxq/easytier-manager/main/easytier.zh.sh -o easytier.sh
+sudo sh easytier.sh
+```
+
 > 🔔 脚本需要 `curl` 和 `unzip`。若缺失，脚本会提示对应的安装命令。
+> 💡 随时可按 `Ctrl+C` **安全退出**：安装/写配置等关键步骤会先完成或整体丢弃当前未提交的改动，绝不留下半装的二进制或被截断的配置。
 
 ### 非交互式安装
 
@@ -138,10 +161,12 @@ sudo ET_NONINTERACTIVE=1 \
 本地检查：
 
 ```sh
-shellcheck -s sh easytier.sh
+shellcheck -s sh easytier.sh easytier.zh.sh
 ```
 
 CI 会在每次 push / PR 时对所有 `*.sh` 跑 ShellCheck（见 [`.github/workflows/shellcheck.yml`](.github/workflows/shellcheck.yml)）。
+
+> ⚠️ **`easytier.sh`（英文）与 `easytier.zh.sh`（中文）逻辑必须保持一致**：改动逻辑时请同步修改两份，仅界面文案/注释按语言区分。
 
 ---
 
