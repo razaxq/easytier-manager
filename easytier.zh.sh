@@ -1380,7 +1380,7 @@ setup_toml_config() {
             printf '\n'; sed 's/^/    /' /etc/easytier/config.toml; printf '\n'
         fi
         local _ed="${EDITOR:-}"
-        [ -z "$_ed" ] && command -v vi > /dev/null 2>&1 && _ed=vi
+        [ -z "$_ed" ] && command -v vi > /dev/null 2>&1 && _ed='vi'
         if [ -n "$_ed" ] && _ask_flag "$(t "  Edit it in ${_ed} before starting? [y/N]: " "  启动前用 ${_ed} 编辑? [y/N]: ")" n; then
             "$_ed" /etc/easytier/config.toml || true
         fi

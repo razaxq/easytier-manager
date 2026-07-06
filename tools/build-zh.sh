@@ -13,7 +13,7 @@
 # ==============================================================================
 set -eu
 
-here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+here=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 src="$here/easytier.sh"
 dst="$here/easytier.zh.sh"
 
