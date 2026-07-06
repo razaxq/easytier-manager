@@ -1917,9 +1917,6 @@ main() {
 
             *) msg_warn "Invalid input" ;;
         esac
-
-        printf "\n  Press Enter to return to the main menu..."
-        read -r _
     done
 }
 

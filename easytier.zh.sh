@@ -1917,9 +1917,6 @@ main() {
 
             *) msg_warn "无效输入" ;;
         esac
-
-        printf "\n  按 Enter 返回主菜单..."
-        read -r _
     done
 }
 
