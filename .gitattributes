@@ -1,0 +1,8 @@
+# Shell 脚本必须始终以 LF 存储与检出。
+# 本仓库通过 `curl | sh` 分发：若混入 CRLF，`#!/bin/sh\r` 会在 Linux/BusyBox 上
+# 触发 "bad interpreter"，循环体里的 `do\r` 也会被 dash/ash 判为语法错误。
+# 显式声明可覆盖各贡献者不同的 core.autocrlf 设置，避免误提交 CRLF。
+*.sh text eol=lf
+
+# 其余文本按平台正常化，二进制不动
+* text=auto

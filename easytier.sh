@@ -39,7 +39,7 @@
 #     由 main() 自动收紧（用户显式设的值仍优先）
 # ==============================================================================
 
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.3.0"
 
 # ── 可调参数 ──────────────────────────────────────────
 # 这些 sentinel 记录用户是否显式设置了对应变量；detect_system 后 procd 下会
@@ -54,6 +54,9 @@ ET_INSTALL_WEB_GUI="${ET_INSTALL_WEB_GUI:-0}"   # 1=同时安装 easytier-web GU
 ET_DEFAULT_VERSION="${ET_DEFAULT_VERSION:-v2.4.5}"  # GitHub API 失败时回退的版本号
 LOG_FILE="${LOG_FILE:-/var/log/easytier-manager.log}"
 TMP_DIR="/tmp/et_mgr_$$"
+
+# 全部受管二进制（安装 / 备份轮转 / 卸载 / 状态展示统一遍历此列表；新增二进制只需改这里）
+ET_ALL_BINS="easytier-core easytier-cli easytier-web easytier-web-embed"
 
 # core 文件日志参数 — 默认避免 EasyTier 写入 100MB×10 到进程 cwd
 # 注意：OpenWrt 上 /var → /tmp（tmpfs），重启自清；其他发行版持久化
@@ -109,7 +112,7 @@ section() {
     local len="${#title}"
     printf "\n${C_BLD}  %s${C_RST}\n" "$title"
     printf "  "
-    i=0; while [ $i -lt $((len + 2)) ]; do printf "─"; i=$((i+1)); done
+    local i=0; while [ "$i" -lt $((len + 2)) ]; do printf "─"; i=$((i+1)); done
     printf "\n\n"
 }
 
@@ -193,9 +196,31 @@ detect_system() {
 # ==============================================================================
 #  进程 & 端口工具
 # ==============================================================================
-# 用 -f 匹配完整路径，避免进程名超过 15 字符被截断
-_proc_running() { pgrep -f "/usr/bin/${1}" > /dev/null 2>&1; }
-_proc_pid()     { pgrep -f "/usr/bin/${1}" 2>/dev/null | head -1; }
+# 返回 cmdline 含 /usr/bin/<bin> 的所有 PID。优先 pgrep -f（按完整路径匹配，
+# 避免进程名超过 15 字符被截断）；pgrep 缺失时回退扫描 /proc（BusyBox/OpenWrt
+# 精简固件常不含 pgrep，而所有目标均为 Linux，/proc 恒在，故回退可靠）。
+_pids_of() {
+    if command -v pgrep > /dev/null 2>&1; then
+        pgrep -f "/usr/bin/${1}" 2>/dev/null
+        return
+    fi
+    local p cmd
+    for p in /proc/[0-9]*; do
+        [ -r "$p/cmdline" ] || continue
+        cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)
+        case "$cmd" in *"/usr/bin/${1}"*) printf '%s\n' "${p##*/}" ;; esac
+    done
+}
+_proc_running() { [ -n "$(_pids_of "$1")" ]; }
+_proc_pid()     { _pids_of "$1" | head -1; }
+
+# 结束指定二进制的所有进程（替代 killall，规避其 15 字符进程名截断 & 缺失问题）
+_kill_bin() {
+    local pids
+    pids=$(_pids_of "$1" | tr '\n' ' ')
+    [ -n "$pids" ] && kill $pids 2>/dev/null || true
+    return 0
+}
 
 check_proc() {
     local bin="$1" label="${2:-$1}"
@@ -269,106 +294,86 @@ _check_space() {
     case "$a" in y|Y) return 0 ;; *) return 1 ;; esac
 }
 
-# 生成 URL 安全随机密钥（64 hex 字符）
+# 生成随机密钥（三条路径统一输出 64 hex 字符）
 gen_secret() {
+    local s=""
     if command -v openssl > /dev/null 2>&1; then
-        openssl rand -hex 32
+        s=$(openssl rand -hex 32)
     elif [ -r /dev/urandom ]; then
-        dd if=/dev/urandom bs=32 count=1 2>/dev/null | \
-            od -An -tx1 | tr -d ' \n' | head -c 64
+        s=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | \
+            od -An -tx1 | tr -d ' \n' | head -c 64)
     else
         # 最后备选（强度低，仅应急）。$RANDOM 在 busybox ash 可用；POSIX 未定义时回退为 0。
         # shellcheck disable=SC3028
-        printf '%s%s%s' "$(date +%s)" "$$" "${RANDOM:-0}" | \
-            od -An -tx1 | tr -d ' \n' | head -c 32
-        msg_warn "无法读取 /dev/urandom，密钥强度较低，建议上线前手动替换"
+        while [ "${#s}" -lt 64 ]; do
+            s="${s}$(printf '%s%s%s' "$(date +%s 2>/dev/null)" "$$" "${RANDOM:-0}" | \
+                od -An -tx1 | tr -d ' \n')"
+        done
+        s=$(printf '%s' "$s" | head -c 64)
+        # 警告发往 stderr，避免被 $(gen_secret) 命令替换连同密钥一起捕获
+        msg_warn "无法读取 /dev/urandom，密钥强度较低，建议上线前手动替换" >&2
     fi
+    printf '%s\n' "$s"
 }
 
 # ==============================================================================
 #  服务管理 — 统一入口，按 INIT_SYS 分支
 # ==============================================================================
-svc_stop() {
+# ── 内部实现：按 INIT_SYS 分支操作指定服务名（core→easytier，web→easytier-web）──
+_svc_stop() {
+    local name="$1"
     case "$INIT_SYS" in
-        procd)   [ -f /etc/init.d/easytier ]  && /etc/init.d/easytier stop 2>/dev/null || true ;;
-        systemd) systemctl stop easytier  2>/dev/null || true ;;
-        openrc)  rc-service easytier stop 2>/dev/null || true ;;
+        procd)   [ -f "/etc/init.d/$name" ] && "/etc/init.d/$name" stop 2>/dev/null || true ;;
+        systemd) systemctl stop "$name"  2>/dev/null || true ;;
+        openrc)  rc-service "$name" stop 2>/dev/null || true ;;
     esac
 }
 
-svc_start() {
+_svc_start() {
+    local name="$1"
     case "$INIT_SYS" in
-        procd)   /etc/init.d/easytier enable && /etc/init.d/easytier start ;;
-        systemd) systemctl daemon-reload && systemctl enable easytier && systemctl start easytier ;;
-        openrc)  rc-update add easytier default 2>/dev/null; rc-service easytier start ;;
+        procd)   "/etc/init.d/$name" enable && "/etc/init.d/$name" start ;;
+        systemd) systemctl daemon-reload && systemctl enable "$name" && systemctl start "$name" ;;
+        openrc)  rc-update add "$name" default 2>/dev/null; rc-service "$name" start ;;
     esac
 }
 
-svc_restart() {
+_svc_restart() {
+    local name="$1"
     case "$INIT_SYS" in
-        procd)   /etc/init.d/easytier restart  2>/dev/null || true ;;
-        systemd) systemctl restart easytier    2>/dev/null || true ;;
-        openrc)  rc-service easytier restart   2>/dev/null || true ;;
+        procd)   "/etc/init.d/$name" restart 2>/dev/null || true ;;
+        systemd) systemctl restart "$name"   2>/dev/null || true ;;
+        openrc)  rc-service "$name" restart  2>/dev/null || true ;;
     esac
 }
 
-svc_remove() {
+_svc_remove() {
+    local name="$1"
     case "$INIT_SYS" in
         procd)
-            [ -f /etc/init.d/easytier ] && {
-                /etc/init.d/easytier disable 2>/dev/null || true
-                rm -f /etc/init.d/easytier
+            [ -f "/etc/init.d/$name" ] && {
+                "/etc/init.d/$name" disable 2>/dev/null || true
+                rm -f "/etc/init.d/$name"
             } ;;
         systemd)
-            systemctl disable easytier 2>/dev/null || true
-            rm -f /etc/systemd/system/easytier.service
+            systemctl disable "$name" 2>/dev/null || true
+            rm -f "/etc/systemd/system/${name}.service"
             systemctl daemon-reload 2>/dev/null || true ;;
         openrc)
-            rc-update del easytier default 2>/dev/null || true
-            rm -f /etc/init.d/easytier ;;
+            rc-update del "$name" default 2>/dev/null || true
+            rm -f "/etc/init.d/$name" ;;
     esac
 }
 
-svc_stop_web() {
-    case "$INIT_SYS" in
-        procd)   [ -f /etc/init.d/easytier-web ] && /etc/init.d/easytier-web stop 2>/dev/null || true ;;
-        systemd) systemctl stop easytier-web  2>/dev/null || true ;;
-        openrc)  rc-service easytier-web stop 2>/dev/null || true ;;
-    esac
-}
-
-svc_start_web() {
-    case "$INIT_SYS" in
-        procd)   /etc/init.d/easytier-web enable && /etc/init.d/easytier-web start ;;
-        systemd) systemctl daemon-reload && systemctl enable easytier-web && systemctl start easytier-web ;;
-        openrc)  rc-update add easytier-web default 2>/dev/null; rc-service easytier-web start ;;
-    esac
-}
-
-svc_restart_web() {
-    case "$INIT_SYS" in
-        procd)   /etc/init.d/easytier-web restart  2>/dev/null || true ;;
-        systemd) systemctl restart easytier-web    2>/dev/null || true ;;
-        openrc)  rc-service easytier-web restart   2>/dev/null || true ;;
-    esac
-}
-
-svc_remove_web() {
-    case "$INIT_SYS" in
-        procd)
-            [ -f /etc/init.d/easytier-web ] && {
-                /etc/init.d/easytier-web disable 2>/dev/null || true
-                rm -f /etc/init.d/easytier-web
-            } ;;
-        systemd)
-            systemctl disable easytier-web 2>/dev/null || true
-            rm -f /etc/systemd/system/easytier-web.service
-            systemctl daemon-reload 2>/dev/null || true ;;
-        openrc)
-            rc-update del easytier-web default 2>/dev/null || true
-            rm -f /etc/init.d/easytier-web ;;
-    esac
-}
+# ── 公开入口：core 与 web 两套服务，薄封装到上面的通用实现 ──
+svc_stop()        { _svc_stop    easytier;     }
+svc_start()       { _svc_start   easytier;     }
+svc_restart()     { _svc_restart easytier;     }
+svc_remove()      { _svc_remove  easytier;     }
+svc_stop_web()    { _svc_stop    easytier-web; }
+svc_start_web()   { _svc_start   easytier-web; }
+svc_restart_web() { _svc_restart easytier-web; }
+svc_remove_web()  { _svc_remove  easytier-web; }
 
 # ==============================================================================
 #  服务文件写入 — core
@@ -590,6 +595,7 @@ select_version() {
                 gsub(/.*"published_at"[[:space:]]*:[[:space:]]*/, "", val)
                 val = trimstr(val)
                 gsub(/T.*$/, "", val)   # 只保留 YYYY-MM-DD
+                if (val == "null") val = ""   # 草稿版本无发布日期 → 留空以跳过该条
                 date = val
             }
             else if (index($0, "\"prerelease\"") > 0) {
@@ -614,6 +620,14 @@ select_version() {
     if [ "$count" -eq 0 ]; then
         msg_warn "解析失败，回退到内置默认版本 ${ET_DEFAULT_VERSION}"
         VER="$ET_DEFAULT_VERSION"; return 0
+    fi
+
+    # 非交互且未显式指定 ET_VERSION：直接取列表首条（最新），不进入交互选择
+    if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
+        VER=$(sed -n '1p' "$rel_file" | awk '{print $1}')
+        [ -z "$VER" ] && VER="$ET_DEFAULT_VERSION"
+        msg_ok "非交互：使用最新版本 ${VER}"
+        return 0
     fi
 
     while true; do
@@ -743,7 +757,7 @@ do_install_bins() {
     # 决定是否备份旧二进制（默认不备份；存在旧版本时询问）
     KEEP_BACKUP=0
     local has_existing=0
-    for bin in easytier-core easytier-cli easytier-web easytier-web-embed; do
+    for bin in $ET_ALL_BINS; do
         [ -f "/usr/bin/$bin" ] && { has_existing=1; break; }
     done
     if [ "$has_existing" = "1" ]; then
@@ -768,7 +782,7 @@ do_install_bins() {
     [ "$need_mb" -gt 0 ] && { _check_space "/usr/bin" "$need_mb" "/usr/bin" || return 1; }
 
     section "安装二进制文件 → /usr/bin/"
-    for bin in easytier-core easytier-cli easytier-web easytier-web-embed; do
+    for bin in $ET_ALL_BINS; do
         local will_install=0
         for w in $install_list; do [ "$w" = "$bin" ] && will_install=1 && break; done
         if [ "$will_install" = "1" ] && [ -f "${extract_dir}/${bin}" ]; then
@@ -839,7 +853,7 @@ _prune_glob() {
 }
 
 _prune_backups() {
-    for bin in easytier-core easytier-cli easytier-web easytier-web-embed; do
+    for bin in $ET_ALL_BINS; do
         _prune_glob "/usr/bin/${bin}.bak.*" "二进制备份"
     done
     _prune_glob "/etc/easytier/config.toml.bak.*" "配置备份"
@@ -886,7 +900,9 @@ _toml_wizard() {
     local def_ip="${ET_VIRTUAL_IP:-}"
     while true; do
         printf "  虚拟 IPv4   [例: 10.0.0.1/24]: "
-        if [ "${ET_NONINTERACTIVE:-0}" = "1" ] && [ -n "$def_ip" ]; then
+        if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
+            [ -n "$def_ip" ] || die "非交互模式需设置 ET_VIRTUAL_IP（如 10.0.0.1/24）"
+            is_valid_cidr "$def_ip" || die "ET_VIRTUAL_IP 格式无效: $def_ip"
             printf '%s\n' "$def_ip"; _TOML_IP="$def_ip"; break
         fi
         read -r _TOML_IP
@@ -899,7 +915,8 @@ _toml_wizard() {
     local def_net="${ET_NETWORK_NAME:-}"
     while true; do
         printf "  网络名称    [自定义字符串]: "
-        if [ "${ET_NONINTERACTIVE:-0}" = "1" ] && [ -n "$def_net" ]; then
+        if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
+            [ -n "$def_net" ] || die "非交互模式需设置 ET_NETWORK_NAME"
             printf '%s\n' "$def_net"; _TOML_NET_NAME="$def_net"; break
         fi
         read -r _TOML_NET_NAME
@@ -1115,9 +1132,15 @@ ask_core_web_url() {
 
     # 非交互模式
     if [ -n "${ET_WEB_URL:-}" ]; then
+        if ! is_valid_url "$ET_WEB_URL"; then
+            die "ET_WEB_URL 协议无效（须 tcp/udp/ws/wss://）: $ET_WEB_URL"
+        fi
         _write_core_args "-w" "$ET_WEB_URL"
         msg_ok "接入 URL 已保存（非交互）: $ET_WEB_URL"
         return 0
+    fi
+    if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
+        die "非交互 web 模式需设置 ET_WEB_URL（如 udp://host:22020/user）"
     fi
 
     while true; do
@@ -1320,7 +1343,7 @@ show_file_locations() {
     section "已安装文件位置"
 
     printf "  ${C_BLD}[ 二进制 ]${C_RST}  /usr/bin/\n"
-    for bin in easytier-core easytier-cli easytier-web easytier-web-embed; do
+    for bin in $ET_ALL_BINS; do
         if [ -f "/usr/bin/$bin" ]; then
             local size; size=$(du -sh "/usr/bin/$bin" 2>/dev/null | awk '{print $1}')
             printf "  ${C_GRN}✓${C_RST}  %-30s  %s\n" "$bin" "$size"
@@ -1421,13 +1444,13 @@ _uninstall_one() {
         easytier-core)
             msg_info "停止并移除 easytier 服务..."
             svc_stop; svc_remove
-            killall easytier-core 2>/dev/null || true
+            _kill_bin easytier-core
             ip link del easytier0 2>/dev/null || true
             ;;
         easytier-web-embed)
             msg_info "停止并移除 easytier-web 服务..."
             svc_stop_web; svc_remove_web
-            killall easytier-web-embed 2>/dev/null || true
+            _kill_bin easytier-web-embed
             ;;
     esac
 
@@ -1448,9 +1471,9 @@ _uninstall_all() {
     msg_info "停止并移除服务..."
     svc_stop; svc_stop_web
     svc_remove; svc_remove_web
-    killall easytier-core      2>/dev/null || true
-    killall easytier-web-embed 2>/dev/null || true
-    for bin in easytier-core easytier-cli easytier-web easytier-web-embed; do
+    _kill_bin easytier-core
+    _kill_bin easytier-web-embed
+    for bin in $ET_ALL_BINS; do
         rm -f "/usr/bin/$bin"
     done
     ip link del easytier0 2>/dev/null || true
@@ -1514,7 +1537,7 @@ do_uninstall() {
 
     # 收集当前已装的二进制
     local installed="" idx=0
-    for bin in easytier-core easytier-cli easytier-web easytier-web-embed; do
+    for bin in $ET_ALL_BINS; do
         [ -f "/usr/bin/$bin" ] && installed="${installed}${installed:+ }$bin"
     done
     if [ -z "$installed" ]; then
@@ -1624,6 +1647,27 @@ main() {
     check_deps
 
     _log "INFO" "脚本启动 v${SCRIPT_VERSION} OS=${OS_TYPE} INIT=${INIT_SYS} ARCH=${ARCH_NAME} BACKUP=${ET_BACKUP_KEEP} LOG=${ET_FILE_LOG_SIZE}MB×${ET_FILE_LOG_COUNT}"
+
+    # ── 非交互模式：一次性完成安装 / 更新后退出（供 CI / Ansible 调用）────
+    # 交互菜单需要 tty；非交互下 stdin 为 EOF，若落入菜单会空转，故在此直接分发。
+    if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
+        select_version                   || die "版本选择失败"
+        do_download "$VER" "$ARCH_NAME"  || die "下载失败"
+        do_install_bins "$EXTRACT_DIR"   || die "安装失败"
+        # 已部署过 web-embed 则一并升级，避免与 core 版本错配
+        [ -f /etc/easytier/web.args ] && _install_extra_bin easytier-web-embed
+        do_setup_mode                    || die "配置失败（检查 ET_MODE / ET_VIRTUAL_IP / ET_WEB_URL 等）"
+        svc_write_core
+        svc_stop 2>/dev/null || true
+        svc_start
+        check_proc easytier-core "easytier-core" || true
+        if [ -f /etc/easytier/web.args ]; then
+            svc_write_web && svc_restart_web
+            check_proc easytier-web-embed "easytier-web-embed" || true
+        fi
+        _log "INFO" "非交互安装完成 VER=${VER}"
+        exit 0
+    fi
 
     # ── 旧版（< 2.1.0）core.args 缺少 --file-log-* 时一次性补齐 ────
     # 不补齐的话，老的服务仍会把 100MB×10 滚动日志写到 cwd（procd 下=/）
