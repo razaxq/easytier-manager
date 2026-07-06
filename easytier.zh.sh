@@ -39,7 +39,7 @@
 #     由 main() 自动收紧（用户显式设的值仍优先）
 # ==============================================================================
 
-SCRIPT_VERSION="2.4.0"
+SCRIPT_VERSION="2.5.0"
 
 # ── 可调参数 ──────────────────────────────────────────
 # 这些 sentinel 记录用户是否显式设置了对应变量；detect_system 后 procd 下会
@@ -914,7 +914,7 @@ _install_extra_bin() {
     fi
     [ -f "/usr/bin/$bin" ] && return 0
     msg_warn "${bin} 不在已下载的压缩包中，且未安装"
-    msg_info "请先在主菜单选「1) 更新 / 重装」获取此版本完整压缩包"
+    msg_info "请先在主菜单选「6) 更新 / 重装」获取此版本完整压缩包"
     return 1
 }
 
@@ -1776,7 +1776,7 @@ main() {
         _commit_tmp "$_tmp" /etc/easytier/core.args 600
         crit_end
         svc_write_core 2>/dev/null || true
-        msg_info "请在主菜单选「4) 仅重启服务」让新参数生效"
+        msg_info "请在主菜单选「2) 重启服务」让新参数生效"
     fi
 
     while true; do
@@ -1784,13 +1784,18 @@ main() {
 
         printf '\n'
         if [ -f /usr/bin/easytier-core ]; then
-            printf "  ${C_BLD}1)${C_RST}  更新 / 重装（选择版本）\n"
-            printf "  ${C_BLD}2)${C_RST}  卸载\n"
-            printf "  ${C_BLD}3)${C_RST}  重新配置并重启服务\n"
-            printf "  ${C_BLD}4)${C_RST}  仅重启服务\n"
-            printf "  ${C_BLD}5)${C_RST}  查看服务状态\n"
-            printf "  ${C_BLD}6)${C_RST}  Web 控制台管理\n"
-            printf "  ${C_BLD}7)${C_RST}  查看已安装文件位置\n"
+            printf "  ${C_DIM}── 日常 ──${C_RST}\n"
+            printf "  ${C_BLD}1)${C_RST}  查看服务状态\n"
+            printf "  ${C_BLD}2)${C_RST}  重启服务\n"
+            printf "  ${C_BLD}3)${C_RST}  停止服务\n"
+            printf "  ${C_DIM}── 配置 ──${C_RST}\n"
+            printf "  ${C_BLD}4)${C_RST}  修改配置（TOML / Web 模式向导）\n"
+            printf "  ${C_BLD}5)${C_RST}  Web 控制台管理\n"
+            printf "  ${C_DIM}── 安装维护 ──${C_RST}\n"
+            printf "  ${C_BLD}6)${C_RST}  更新 / 重装（选择版本）\n"
+            printf "  ${C_BLD}7)${C_RST}  文件位置与日志\n"
+            printf "  ${C_BLD}8)${C_RST}  卸载 EasyTier\n"
+            printf "\n"
             printf "  ${C_BLD}0)${C_RST}  退出\n"
         else
             printf "  ${C_BLD}1)${C_RST}  安装\n"
@@ -1800,62 +1805,12 @@ main() {
         printf "  请选择: "
         read -r choice
 
-        case "$choice" in
-
-            # ── 退出 ────────────────────────────────────────────────
-            0) printf "\n  再见\n\n"; _log "INFO" "脚本退出"; exit 0 ;;
-
-            # ── 安装 / 更新 ─────────────────────────────────────────
-            1)
-                select_version || continue
-
-                if [ -f /usr/bin/easytier-core ]; then
-                    local cur latest
-                    cur=$(/usr/bin/easytier-core --version 2>&1 | \
-                          awk '{print $2}' | cut -d'-' -f1)
-                    latest=$(printf '%s' "$VER" | sed 's/^v//')
-
-                    section "更新方式"
-                    printf "  ${C_BLD}1)${C_RST}  仅更新二进制（保留现有配置）\n"
-                    printf "  ${C_BLD}2)${C_RST}  更新二进制并重新配置\n"
-                    [ "$cur" = "$latest" ] && \
-                        msg_warn "当前已是 ${VER}，选 1 将重装相同版本"
-                    printf "  ${C_BLD}0)${C_RST}  返回\n\n"
-                    printf "  请选择 [0-2，默认 1]: "
-                    read -r up
-                    [ -z "$up" ] && up=1
-
-                    case "$up" in
-                        0) continue ;;
-                        1)
-                            do_download "$VER" "$ARCH_NAME"  || continue
-                            do_install_bins "$EXTRACT_DIR"   || continue
-                            # 现有配置有 web.args 说明本机跑过 web-embed，按需跟着升级
-                            [ -f /etc/easytier/web.args ] && _install_extra_bin easytier-web-embed
-                            # 重写服务文件（systemd ExecStart 含版本路径，需更新）
-                            [ -f /etc/easytier/core.args ] && svc_write_core || true
-                            svc_start
-                            check_proc easytier-core "easytier-core"
-                            if [ -f /etc/easytier/web.args ]; then
-                                svc_write_web; svc_start_web
-                                check_proc easytier-web-embed "easytier-web-embed"
-                            fi
-                            ;;
-                        2)
-                            do_download "$VER" "$ARCH_NAME"  || continue
-                            do_install_bins "$EXTRACT_DIR"   || continue
-                            if do_setup_mode; then
-                                svc_write_core; svc_stop 2>/dev/null || true
-                                svc_start
-                                check_proc easytier-core "easytier-core"
-                            else
-                                msg_warn "已跳过配置，二进制已更新但服务未重启"
-                            fi
-                            ;;
-                        *) msg_warn "无效输入"; continue ;;
-                    esac
-                else
-                    # 全新安装
+        # ── 未安装状态：只有「安装」与「退出」──────────────────────
+        if [ ! -f /usr/bin/easytier-core ]; then
+            case "$choice" in
+                0) printf "\n  再见\n\n"; _log "INFO" "脚本退出"; exit 0 ;;
+                1)
+                    select_version                   || continue
                     do_download "$VER" "$ARCH_NAME"  || continue
                     do_install_bins "$EXTRACT_DIR"   || continue
                     if do_setup_mode; then
@@ -1863,32 +1818,25 @@ main() {
                         svc_start
                         check_proc easytier-core "easytier-core"
                     else
-                        msg_warn "二进制已安装，请稍后通过选项 3 完成配置"
+                        msg_warn "二进制已安装，请稍后通过主菜单「4) 修改配置」完成配置"
                     fi
-                fi
-                show_file_locations
-                ;;
+                    show_file_locations
+                    ;;
+                *) msg_warn "无效输入" ;;
+            esac
+            continue
+        fi
 
-            # ── 卸载 ────────────────────────────────────────────────
+        case "$choice" in
+
+            # ── 退出 ────────────────────────────────────────────────
+            0) printf "\n  再见\n\n"; _log "INFO" "脚本退出"; exit 0 ;;
+
+            # ── 状态 ───────────────────────────────────────
+            1) do_view_status ;;
+
+            # ── 重启服务 ───────────────────────────────────
             2)
-                [ -f /usr/bin/easytier-core ] || { msg_warn "EasyTier 未安装"; continue; }
-                do_uninstall || true
-                ;;
-
-            # ── 重新配置 ─────────────────────────────────────────────
-            3)
-                [ -f /usr/bin/easytier-core ] || { msg_warn "EasyTier 未安装"; continue; }
-                if do_setup_mode; then
-                    svc_write_core
-                    svc_stop 2>/dev/null || true
-                    svc_start
-                    check_proc easytier-core "easytier-core"
-                fi
-                ;;
-
-            # ── 仅重启 ─────────────────────────────────────
-            4)
-                [ -f /usr/bin/easytier-core ] || { msg_warn "EasyTier 未安装"; continue; }
                 msg_info "重启 easytier-core..."
                 svc_restart
                 check_proc easytier-core "easytier-core"
@@ -1903,17 +1851,92 @@ main() {
                 fi
                 ;;
 
-            # ── 状态 ───────────────────────────────────────
-            5) do_view_status ;;
+            # ── 停止服务 ───────────────────────────────────
+            3)
+                msg_info "停止 easytier-core..."
+                svc_stop && msg_ok "已停止"
+                if _proc_running "easytier-web-embed"; then
+                    printf "  同时停止 easytier-web-embed? [y/N]: "
+                    read -r a
+                    case "$a" in
+                        y|Y) svc_stop_web && msg_ok "easytier-web-embed 已停止" ;;
+                        *) ;;
+                    esac
+                fi
+                ;;
+
+            # ── 修改配置 ─────────────────────────────────────────────
+            4)
+                if do_setup_mode; then
+                    svc_write_core
+                    svc_stop 2>/dev/null || true
+                    svc_start
+                    check_proc easytier-core "easytier-core"
+                fi
+                ;;
 
             # ── Web 管理 ───────────────────────────────────
-            6)
+            5)
                 # do_manage_web 内子菜单 3 调 setup_web_console 会按需安装 web-embed
                 do_manage_web
                 ;;
 
-            # ── 文件位置 ─────────────────────────────────────────────
+            # ── 更新 / 重装 ─────────────────────────────────────────
+            6)
+                select_version || continue
+
+                local cur latest
+                cur=$(/usr/bin/easytier-core --version 2>&1 | \
+                      awk '{print $2}' | cut -d'-' -f1)
+                latest=$(printf '%s' "$VER" | sed 's/^v//')
+
+                section "更新方式"
+                printf "  ${C_BLD}1)${C_RST}  仅更新二进制（保留现有配置）\n"
+                printf "  ${C_BLD}2)${C_RST}  更新二进制并重新配置\n"
+                [ "$cur" = "$latest" ] && \
+                    msg_warn "当前已是 ${VER}，选 1 将重装相同版本"
+                printf "  ${C_BLD}0)${C_RST}  返回\n\n"
+                printf "  请选择 [0-2，默认 1]: "
+                read -r up
+                [ -z "$up" ] && up=1
+
+                case "$up" in
+                    0) continue ;;
+                    1)
+                        do_download "$VER" "$ARCH_NAME"  || continue
+                        do_install_bins "$EXTRACT_DIR"   || continue
+                        # 现有配置有 web.args 说明本机跑过 web-embed，按需跟着升级
+                        [ -f /etc/easytier/web.args ] && _install_extra_bin easytier-web-embed
+                        # 重写服务文件（systemd ExecStart 含版本路径，需更新）
+                        [ -f /etc/easytier/core.args ] && svc_write_core || true
+                        svc_start
+                        check_proc easytier-core "easytier-core"
+                        if [ -f /etc/easytier/web.args ]; then
+                            svc_write_web; svc_start_web
+                            check_proc easytier-web-embed "easytier-web-embed"
+                        fi
+                        ;;
+                    2)
+                        do_download "$VER" "$ARCH_NAME"  || continue
+                        do_install_bins "$EXTRACT_DIR"   || continue
+                        if do_setup_mode; then
+                            svc_write_core; svc_stop 2>/dev/null || true
+                            svc_start
+                            check_proc easytier-core "easytier-core"
+                        else
+                            msg_warn "已跳过配置，二进制已更新但服务未重启"
+                        fi
+                        ;;
+                    *) msg_warn "无效输入"; continue ;;
+                esac
+                show_file_locations
+                ;;
+
+            # ── 文件位置与日志 ───────────────────────────────────────
             7) show_file_locations ;;
+
+            # ── 卸载 ────────────────────────────────────────────────
+            8) do_uninstall || true ;;
 
             *) msg_warn "无效输入" ;;
         esac

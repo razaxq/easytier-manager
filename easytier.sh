@@ -39,7 +39,7 @@
 #     are auto-tightened by main() (values you set explicitly still win)
 # ==============================================================================
 
-SCRIPT_VERSION="2.4.0"
+SCRIPT_VERSION="2.5.0"
 
 # ── Tunables ──────────────────────────────────────────
 # These sentinels record whether the user set the vars explicitly; after detect_system, on procd we
@@ -914,7 +914,7 @@ _install_extra_bin() {
     fi
     [ -f "/usr/bin/$bin" ] && return 0
     msg_warn "${bin} is not in the downloaded archive and is not installed"
-    msg_info "First choose '1) Update / reinstall' in the main menu to fetch the full archive for this version"
+    msg_info "First choose '6) Update / reinstall' in the main menu to fetch the full archive for this version"
     return 1
 }
 
@@ -1776,7 +1776,7 @@ main() {
         _commit_tmp "$_tmp" /etc/easytier/core.args 600
         crit_end
         svc_write_core 2>/dev/null || true
-        msg_info "Choose '4) Restart services only' in the main menu to apply the new params"
+        msg_info "Choose '2) Restart services' in the main menu to apply the new params"
     fi
 
     while true; do
@@ -1784,13 +1784,18 @@ main() {
 
         printf '\n'
         if [ -f /usr/bin/easytier-core ]; then
-            printf "  ${C_BLD}1)${C_RST}  Update / reinstall (choose version)\n"
-            printf "  ${C_BLD}2)${C_RST}  Uninstall\n"
-            printf "  ${C_BLD}3)${C_RST}  Reconfigure and restart services\n"
-            printf "  ${C_BLD}4)${C_RST}  Restart services only\n"
-            printf "  ${C_BLD}5)${C_RST}  View service status\n"
-            printf "  ${C_BLD}6)${C_RST}  Web console management\n"
-            printf "  ${C_BLD}7)${C_RST}  Show installed file locations\n"
+            printf "  ${C_DIM}── Service ──${C_RST}\n"
+            printf "  ${C_BLD}1)${C_RST}  View service status\n"
+            printf "  ${C_BLD}2)${C_RST}  Restart services\n"
+            printf "  ${C_BLD}3)${C_RST}  Stop services\n"
+            printf "  ${C_DIM}── Configuration ──${C_RST}\n"
+            printf "  ${C_BLD}4)${C_RST}  Change configuration (TOML / Web mode wizard)\n"
+            printf "  ${C_BLD}5)${C_RST}  Web console management\n"
+            printf "  ${C_DIM}── Maintenance ──${C_RST}\n"
+            printf "  ${C_BLD}6)${C_RST}  Update / reinstall (choose version)\n"
+            printf "  ${C_BLD}7)${C_RST}  File locations & logs\n"
+            printf "  ${C_BLD}8)${C_RST}  Uninstall EasyTier\n"
+            printf "\n"
             printf "  ${C_BLD}0)${C_RST}  Exit\n"
         else
             printf "  ${C_BLD}1)${C_RST}  Install\n"
@@ -1800,62 +1805,12 @@ main() {
         printf "  Select: "
         read -r choice
 
-        case "$choice" in
-
-            # ── Exit ────────────────────────────────────────────────
-            0) printf "\n  Bye\n\n"; _log "INFO" "Script exit"; exit 0 ;;
-
-            # ── Install / update ─────────────────────────────────────────
-            1)
-                select_version || continue
-
-                if [ -f /usr/bin/easytier-core ]; then
-                    local cur latest
-                    cur=$(/usr/bin/easytier-core --version 2>&1 | \
-                          awk '{print $2}' | cut -d'-' -f1)
-                    latest=$(printf '%s' "$VER" | sed 's/^v//')
-
-                    section "Update method"
-                    printf "  ${C_BLD}1)${C_RST}  Update binaries only (keep current config)\n"
-                    printf "  ${C_BLD}2)${C_RST}  Update binaries and reconfigure\n"
-                    [ "$cur" = "$latest" ] && \
-                        msg_warn "Already on ${VER}; choosing 1 reinstalls the same version"
-                    printf "  ${C_BLD}0)${C_RST}  Back\n\n"
-                    printf "  Select [0-2, default 1]: "
-                    read -r up
-                    [ -z "$up" ] && up=1
-
-                    case "$up" in
-                        0) continue ;;
-                        1)
-                            do_download "$VER" "$ARCH_NAME"  || continue
-                            do_install_bins "$EXTRACT_DIR"   || continue
-                            # web.args present means web-embed ran here; upgrade it on demand too
-                            [ -f /etc/easytier/web.args ] && _install_extra_bin easytier-web-embed
-                            # rewrite service files (systemd ExecStart embeds the path, needs updating)
-                            [ -f /etc/easytier/core.args ] && svc_write_core || true
-                            svc_start
-                            check_proc easytier-core "easytier-core"
-                            if [ -f /etc/easytier/web.args ]; then
-                                svc_write_web; svc_start_web
-                                check_proc easytier-web-embed "easytier-web-embed"
-                            fi
-                            ;;
-                        2)
-                            do_download "$VER" "$ARCH_NAME"  || continue
-                            do_install_bins "$EXTRACT_DIR"   || continue
-                            if do_setup_mode; then
-                                svc_write_core; svc_stop 2>/dev/null || true
-                                svc_start
-                                check_proc easytier-core "easytier-core"
-                            else
-                                msg_warn "Configuration skipped; binaries updated but services not restarted"
-                            fi
-                            ;;
-                        *) msg_warn "Invalid input"; continue ;;
-                    esac
-                else
-                    # fresh install
+        # ── Not installed: only "Install" and "Exit" ──────────────────
+        if [ ! -f /usr/bin/easytier-core ]; then
+            case "$choice" in
+                0) printf "\n  Bye\n\n"; _log "INFO" "Script exit"; exit 0 ;;
+                1)
+                    select_version                   || continue
                     do_download "$VER" "$ARCH_NAME"  || continue
                     do_install_bins "$EXTRACT_DIR"   || continue
                     if do_setup_mode; then
@@ -1863,32 +1818,25 @@ main() {
                         svc_start
                         check_proc easytier-core "easytier-core"
                     else
-                        msg_warn "Binaries installed; complete configuration later via option 3"
+                        msg_warn "Binaries installed; complete configuration later via '4) Change configuration'"
                     fi
-                fi
-                show_file_locations
-                ;;
+                    show_file_locations
+                    ;;
+                *) msg_warn "Invalid input" ;;
+            esac
+            continue
+        fi
 
-            # ── Uninstall ────────────────────────────────────────────────
+        case "$choice" in
+
+            # ── Exit ────────────────────────────────────────────────
+            0) printf "\n  Bye\n\n"; _log "INFO" "Script exit"; exit 0 ;;
+
+            # ── Status ───────────────────────────────────────
+            1) do_view_status ;;
+
+            # ── Restart services ─────────────────────────────
             2)
-                [ -f /usr/bin/easytier-core ] || { msg_warn "EasyTier is not installed"; continue; }
-                do_uninstall || true
-                ;;
-
-            # ── Reconfigure ─────────────────────────────────────────────
-            3)
-                [ -f /usr/bin/easytier-core ] || { msg_warn "EasyTier is not installed"; continue; }
-                if do_setup_mode; then
-                    svc_write_core
-                    svc_stop 2>/dev/null || true
-                    svc_start
-                    check_proc easytier-core "easytier-core"
-                fi
-                ;;
-
-            # ── Restart only ─────────────────────────────────────
-            4)
-                [ -f /usr/bin/easytier-core ] || { msg_warn "EasyTier is not installed"; continue; }
                 msg_info "Restarting easytier-core..."
                 svc_restart
                 check_proc easytier-core "easytier-core"
@@ -1903,17 +1851,92 @@ main() {
                 fi
                 ;;
 
-            # ── Status ───────────────────────────────────────
-            5) do_view_status ;;
+            # ── Stop services ────────────────────────────────
+            3)
+                msg_info "Stopping easytier-core..."
+                svc_stop && msg_ok "Stopped"
+                if _proc_running "easytier-web-embed"; then
+                    printf "  Also stop easytier-web-embed? [y/N]: "
+                    read -r a
+                    case "$a" in
+                        y|Y) svc_stop_web && msg_ok "easytier-web-embed stopped" ;;
+                        *) ;;
+                    esac
+                fi
+                ;;
+
+            # ── Reconfigure ─────────────────────────────────────────────
+            4)
+                if do_setup_mode; then
+                    svc_write_core
+                    svc_stop 2>/dev/null || true
+                    svc_start
+                    check_proc easytier-core "easytier-core"
+                fi
+                ;;
 
             # ── Web management ───────────────────────────────────
-            6)
+            5)
                 # submenu 3 in do_manage_web calls setup_web_console, which installs web-embed on demand
                 do_manage_web
                 ;;
 
-            # ── File locations ─────────────────────────────────────────────
+            # ── Update / reinstall ─────────────────────────────────────
+            6)
+                select_version || continue
+
+                local cur latest
+                cur=$(/usr/bin/easytier-core --version 2>&1 | \
+                      awk '{print $2}' | cut -d'-' -f1)
+                latest=$(printf '%s' "$VER" | sed 's/^v//')
+
+                section "Update method"
+                printf "  ${C_BLD}1)${C_RST}  Update binaries only (keep current config)\n"
+                printf "  ${C_BLD}2)${C_RST}  Update binaries and reconfigure\n"
+                [ "$cur" = "$latest" ] && \
+                    msg_warn "Already on ${VER}; choosing 1 reinstalls the same version"
+                printf "  ${C_BLD}0)${C_RST}  Back\n\n"
+                printf "  Select [0-2, default 1]: "
+                read -r up
+                [ -z "$up" ] && up=1
+
+                case "$up" in
+                    0) continue ;;
+                    1)
+                        do_download "$VER" "$ARCH_NAME"  || continue
+                        do_install_bins "$EXTRACT_DIR"   || continue
+                        # web.args present means web-embed ran here; upgrade it on demand too
+                        [ -f /etc/easytier/web.args ] && _install_extra_bin easytier-web-embed
+                        # rewrite service files (systemd ExecStart embeds the path, needs updating)
+                        [ -f /etc/easytier/core.args ] && svc_write_core || true
+                        svc_start
+                        check_proc easytier-core "easytier-core"
+                        if [ -f /etc/easytier/web.args ]; then
+                            svc_write_web; svc_start_web
+                            check_proc easytier-web-embed "easytier-web-embed"
+                        fi
+                        ;;
+                    2)
+                        do_download "$VER" "$ARCH_NAME"  || continue
+                        do_install_bins "$EXTRACT_DIR"   || continue
+                        if do_setup_mode; then
+                            svc_write_core; svc_stop 2>/dev/null || true
+                            svc_start
+                            check_proc easytier-core "easytier-core"
+                        else
+                            msg_warn "Configuration skipped; binaries updated but services not restarted"
+                        fi
+                        ;;
+                    *) msg_warn "Invalid input"; continue ;;
+                esac
+                show_file_locations
+                ;;
+
+            # ── File locations & logs ───────────────────────────────────
             7) show_file_locations ;;
+
+            # ── Uninstall ────────────────────────────────────────────────
+            8) do_uninstall || true ;;
 
             *) msg_warn "Invalid input" ;;
         esac
