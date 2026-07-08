@@ -12,21 +12,16 @@
 
 ## 🌐 语言 / Language
 
-脚本**内置中英双语**，语言选择顺序为：`ET_LANG` 环境变量 > 系统 locale 自动识别（`zh*` → 中文）> 默认英文。
+只有 `easytier.sh` 一个脚本，**内置中英双语**。语言选择顺序为：`ET_LANG` 环境变量 > 系统 locale 自动识别（`zh*` → 中文）> 默认英文。
 
-| 文件 | 默认界面语言 | 说明 | Raw URL |
-|---|---|---|---|
-| **`easytier.sh`**（单一真源） | 跟随 locale（默认 English） | 双语脚本，`zh_CN` 等中文环境自动显示中文 | `.../main/easytier.sh` |
-| `easytier.zh.sh` | 简体中文（强制） | 由 `easytier.sh` **自动生成**，即使英文 locale 也显示中文 | `.../main/easytier.zh.sh` |
-
-强制指定语言（对两个文件都生效）：
+在中文环境（`zh_CN` 等）下会自动显示中文；在英文 / `C` locale 的主机上想用中文，设 `ET_LANG=zh` 即可：
 
 ```sh
 ET_LANG=zh sh easytier.sh    # 强制中文
-ET_LANG=en sh easytier.zh.sh # 强制英文
+ET_LANG=en sh easytier.sh    # 强制英文
 ```
 
-> **`easytier.sh` is a single bilingual script.** It auto-detects the language from your locale (`zh*` → Chinese, otherwise English) and honors `ET_LANG=en|zh`. `easytier.zh.sh` is **generated** from it (identical code, just defaulting to Chinese) so Chinese users on an English-locale host can still `curl … easytier.zh.sh | sh`.
+> **`easytier.sh` is a single bilingual script.** It auto-detects the language from your locale (`zh*` → Chinese, otherwise English) and honors `ET_LANG=en|zh`. On an English- or `C`-locale host, set `ET_LANG=zh` to force Chinese.
 
 ---
 
@@ -51,18 +46,15 @@ ET_LANG=en sh easytier.zh.sh # 强制英文
 
 ### 交互式安装（推荐）
 
-英文版（默认）：
-
 ```sh
 curl -fsSL https://raw.githubusercontent.com/razaxq/easytier-manager/main/easytier.sh -o easytier.sh
 sudo sh easytier.sh
 ```
 
-中文版（把文件名换成 `easytier.zh.sh` 即可）：
+中文环境会自动显示中文；英文 / `C` locale 主机可加 `ET_LANG=zh` 强制中文：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/razaxq/easytier-manager/main/easytier.zh.sh -o easytier.sh
-sudo sh easytier.sh
+sudo ET_LANG=zh sh easytier.sh
 ```
 
 > 🔔 脚本需要 `curl` 和 `unzip`。若缺失，脚本会提示对应的安装命令。
@@ -201,13 +193,12 @@ sh easytier.sh help       # 帮助
 本地检查：
 
 ```sh
-shellcheck -s sh easytier.sh tools/build-zh.sh
-sh tools/build-zh.sh                 # 从 easytier.sh 重新生成 easytier.zh.sh
+shellcheck -s sh easytier.sh
 ```
 
 CI 会在每次 push / PR 时对所有 `*.sh` 跑 ShellCheck（见 [`.github/workflows/shellcheck.yml`](.github/workflows/shellcheck.yml)）。
 
-> ⚠️ **只需维护 `easytier.sh` 这一个文件**（中英文案都内联在其 `t "en" "zh"` 调用里）。`easytier.zh.sh` 是生成产物：改完 `easytier.sh` 后运行 `sh tools/build-zh.sh` 重新生成并一并提交，切勿手动编辑中文版。
+> ⚠️ 中英文案都内联在 `easytier.sh` 的 `t "en" "zh"` 调用里，改文案时**两种语言一起改**。
 
 ---
 

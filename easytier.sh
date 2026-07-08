@@ -11,7 +11,7 @@
 #  License: MIT (c) 2026 razaxq
 # ==============================================================================
 #  Bilingual: one script, English + Chinese. Language pick order:
-#    ET_LANG=en|zh   — explicit override (easytier.zh.sh wrapper sets ET_LANG=zh)
+#    ET_LANG=en|zh   — explicit override
 #    otherwise auto-detected from $LC_ALL / $LC_MESSAGES / $LANG (zh* → Chinese)
 #    default: English
 # ==============================================================================
@@ -122,19 +122,14 @@ _TOML_COMPRESS="2"      # [flags] data_compress_algo
 #    · line with printf args    → printf "$(t "FMT_EN" "FMT_ZH")" args…   (color vars/%-specifiers kept in the format)
 #  _log() diagnostic strings intentionally stay English for greppable logs.
 # ==============================================================================
-# ET_LANG_DEFAULT is the only line that differs between easytier.sh (en) and the
-# generated easytier.zh.sh (zh). tools/build-zh.sh flips it. Do not rename the marker.
-ET_LANG_DEFAULT="en"        # et:lang-default
 _LANG="en"
 _detect_lang() {
     case "${ET_LANG:-}" in
         zh|zh[_-]*|ZH|Zh) _LANG="zh"; return ;;
         en|en[_-]*|EN|En) _LANG="en"; return ;;
-        '') ;;                      # unset → decide below
+        '') ;;                      # unset → auto-detect from locale below
         *)  _LANG="en"; return ;;
     esac
-    # ET_LANG unset: the zh build forces zh; the en build auto-detects from locale
-    if [ "$ET_LANG_DEFAULT" = "zh" ]; then _LANG="zh"; return; fi
     case "${LC_ALL:-}${LC_MESSAGES:-}${LANG:-}" in
         *zh*|*ZH*) _LANG="zh" ;;
         *)         _LANG="en" ;;
