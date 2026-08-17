@@ -38,6 +38,7 @@
 #    ET_PEERS=tcp://a:11010,tcp://b:11010  — comma-separated peer list
 #    ET_PROXY_CIDR=192.168.1.0/24,10.9.0.0/24  — subnet proxy CIDR(s), comma-separated (optional)
 #    ET_WEB_URL=udp://host:22020/user      — Web mode join URL
+#    ET_MACHINE_ID=<uuid-or-stable-string> — fixed Web-console machine identity (optional)
 #    ET_FILE_LOG_DIR=...                   — core log directory
 #    ET_FILE_LOG_LEVEL=off|error|warn|info|debug|trace
 #    ET_FILE_LOG_SIZE=<MB>                 — size per log file
@@ -54,7 +55,7 @@
 #     are auto-tightened by main() (values you set explicitly still win)
 # ==============================================================================
 
-SCRIPT_VERSION="2.6.0"
+SCRIPT_VERSION="2.6.1"
 
 # ── Tunables ──────────────────────────────────────────
 # These sentinels record whether the user set the vars explicitly; after detect_system, on procd we
@@ -62,6 +63,7 @@ SCRIPT_VERSION="2.6.0"
 _u_backup=${ET_BACKUP_KEEP:+1}
 _u_lsize=${ET_FILE_LOG_SIZE:+1}
 _u_lcount=${ET_FILE_LOG_COUNT:+1}
+_u_machine_state=${ET_MACHINE_ID_STATE_FILE+x}
 
 ET_BACKUP_KEEP="${ET_BACKUP_KEEP:-3}"           # backups kept per binary
 ET_RELEASES_COUNT="${ET_RELEASES_COUNT:-20}"    # max releases to fetch in the list
@@ -90,6 +92,14 @@ ET_FILE_LOG_COUNT="${ET_FILE_LOG_COUNT:-5}"      # max log files to keep
 
 # minimum free space in /tmp for download+extract (zip ~30MB + extracted ~80MB)
 ET_MIN_TMP_MB="${ET_MIN_TMP_MB:-120}"
+
+# Machine identity files. The path overrides are mainly useful to distributors/tests; normal
+# installations should keep the defaults so EasyTier itself finds the persisted state.
+ET_CORE_ARGS_FILE="${ET_CORE_ARGS_FILE:-/etc/easytier/core.args}"
+ET_MACHINE_ID_STATE_FILE="${ET_MACHINE_ID_STATE_FILE:-/var/lib/easytier/machine_id}"
+ET_LEGACY_MACHINE_ID_FILE="${ET_LEGACY_MACHINE_ID_FILE:-/usr/bin/et_machine_id}"
+ET_CORE_SERVICE_FILE="${ET_CORE_SERVICE_FILE:-/etc/systemd/system/easytier.service}"
+ET_CORE_BIN_FILE="${ET_CORE_BIN_FILE:-/usr/bin/easytier-core}"
 
 # ── Runtime state (filled by detection, do not edit by hand) ──────────────
 OS_TYPE=""      # openwrt | debian | rhel | arch | alpine | unknown
@@ -974,6 +984,10 @@ do_download() {
 do_install_bins() {
     local extract_dir="$1"
 
+    # Must happen while the old binary/config/service are still present. In particular, this
+    # primes EasyTier's 2.4.x -> newer built-in machine-ID migration before the first new start.
+    _prepare_machine_id_upgrade || return 1
+
     msg_info "$(t "Stopping running services..." "停止运行中的服务...")"
     svc_stop; svc_stop_web
 
@@ -1119,18 +1133,160 @@ _prune_backups() {
 #  EasyTier by default writes 100MB×10 rolling logs into cwd; on procd cwd=/, which can fill the root partition.
 #  So we always set --file-log-{dir,level,size,count} explicitly.
 # ==============================================================================
+
+# A command-line machine ID may be a UUID or a stable string (EasyTier hashes the latter).
+# Whitespace cannot be represented safely by every supported init system, so reject it here.
+_machine_id_arg_valid() {
+    [ -n "${1:-}" ] || return 1
+    case "$1" in *[[:space:]]*) return 1 ;; esac
+    return 0
+}
+
+_machine_id_uuid_valid() {
+    printf '%s\n' "${1:-}" | grep -Eiq \
+        '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+}
+
+# Read a line-oriented core.args file. Supports both the manager's two-line form and
+# --machine-id=<value>, which users may have added by hand.
+_machine_id_from_args() {
+    local _file="$1"
+    [ -f "$_file" ] || return 1
+    local _value
+    _value=$(awk '
+        _next { _next=0; if (length($0)) { print; exit } else { exit 2 } }
+        $0 == "--machine-id" { _next=1; next }
+        /^--machine-id=/ { sub(/^--machine-id=/, ""); if (length($0)) print; else exit 2; exit }
+        END { if (_next) exit 2 }
+    ' "$_file") || return $?
+    [ -n "$_value" ] || return 1
+    printf '%s\n' "$_value"
+}
+
+# Older/custom service files sometimes embedded all arguments directly instead of using
+# core.args. Recover that explicit identity before the service file is regenerated.
+_machine_id_from_service() {
+    [ -f "$ET_CORE_SERVICE_FILE" ] || return 1
+    local _value
+    _value=$(awk '
+        {
+            for (i=1; i<=NF; i++) {
+                if ($i == "--machine-id" && i < NF) { print $(i+1); exit }
+                if ($i ~ /^--machine-id=/) { sub(/^--machine-id=/, "", $i); print $i; exit }
+            }
+        }
+    ' "$ET_CORE_SERVICE_FILE")
+    _value=$(printf '%s\n' "$_value" | sed "s/^[\"']\\|[\"']$//g")
+    [ -n "$_value" ] || return 1
+    printf '%s\n' "$_value"
+}
+
+# Select the identity that must survive a rewrite. Priority matches operator intent first,
+# then existing explicit arguments, then EasyTier's persisted/legacy UUID files.
+# Returns: 0=selected, 1=not found, 2=found but invalid. Result is in _SELECTED_MACHINE_ID.
+_select_machine_id() {
+    _SELECTED_MACHINE_ID=""
+    local _candidate="" _source="" _read_rc=0
+
+    if [ "${ET_MACHINE_ID+x}" = "x" ]; then
+        _candidate="$ET_MACHINE_ID"; _source="ET_MACHINE_ID"
+    elif [ -f "$ET_CORE_ARGS_FILE" ]; then
+        _candidate=$(_machine_id_from_args "$ET_CORE_ARGS_FILE") || _read_rc=$?
+        if [ "$_read_rc" -eq 0 ]; then
+            _source="$ET_CORE_ARGS_FILE"
+        elif [ "$_read_rc" -eq 2 ]; then
+            _MACHINE_ID_ERROR="Malformed --machine-id in $ET_CORE_ARGS_FILE"
+            return 2
+        fi
+    fi
+
+    if [ -z "$_source" ] && [ -f "$ET_CORE_SERVICE_FILE" ]; then
+        _candidate=$(_machine_id_from_service) || true
+        [ -n "$_candidate" ] && _source="$ET_CORE_SERVICE_FILE"
+    fi
+
+    if [ -z "$_source" ] && [ -f "$ET_MACHINE_ID_STATE_FILE" ]; then
+        _candidate=$(sed -n '1p' "$ET_MACHINE_ID_STATE_FILE" 2>/dev/null | tr -d '\r')
+        _source="$ET_MACHINE_ID_STATE_FILE"
+        _machine_id_uuid_valid "$_candidate" || {
+            _MACHINE_ID_ERROR="Invalid UUID in $_source"
+            return 2
+        }
+    elif [ -z "$_source" ] && [ -f "$ET_LEGACY_MACHINE_ID_FILE" ]; then
+        _candidate=$(sed -n '1p' "$ET_LEGACY_MACHINE_ID_FILE" 2>/dev/null | tr -d '\r')
+        _source="$ET_LEGACY_MACHINE_ID_FILE"
+        _machine_id_uuid_valid "$_candidate" || {
+            _MACHINE_ID_ERROR="Invalid UUID in $_source"
+            return 2
+        }
+    elif [ -z "$_source" ]; then
+        return 1
+    fi
+
+    _machine_id_arg_valid "$_candidate" || {
+        _MACHINE_ID_ERROR="Invalid machine ID in $_source (must be non-empty and contain no whitespace)"
+        return 2
+    }
+    _SELECTED_MACHINE_ID="$_candidate"
+    return 0
+}
+
+# EasyTier 2.4.x derived its default Web machine ID from machine_uid. New releases migrate that
+# value only when the state directory already contains an entry. Place a harmless marker before
+# replacing a legacy Web-mode binary, so the new core takes its built-in legacy migration path on
+# first start instead of silently registering as a new machine.
+_prepare_machine_id_upgrade() {
+    local _rc=0 _first=""
+    _select_machine_id || _rc=$?
+    case "$_rc" in
+        0) return 0 ;;
+        2) msg_err "$(t "Cannot preserve EasyTier machine identity: $_MACHINE_ID_ERROR" "无法保留 EasyTier 机器身份：$_MACHINE_ID_ERROR")"; return 1 ;;
+    esac
+
+    [ -x "$ET_CORE_BIN_FILE" ] || return 0
+    [ -f "$ET_CORE_ARGS_FILE" ] || return 0
+    _first=$(sed -n '1p' "$ET_CORE_ARGS_FILE" 2>/dev/null)
+    [ "$_first" = "-w" ] || [ "$_first" = "--config-server" ] || return 0
+
+    local _state_dir
+    _state_dir=$(dirname "$ET_MACHINE_ID_STATE_FILE")
+    mkdir -p "$_state_dir" || return 1
+    : > "${_state_dir}/.legacy-machine-id-migration"
+    # OpenRC/procd may preserve HOME or XDG_DATA_HOME, while systemd commonly falls back to
+    # /var/lib. Prime both the configured fallback and the environment-selected upstream path.
+    if [ -z "$_u_machine_state" ]; then
+        if [ -n "${XDG_DATA_HOME:-}" ]; then
+            mkdir -p "$XDG_DATA_HOME/easytier" || return 1
+            : > "$XDG_DATA_HOME/easytier/.legacy-machine-id-migration"
+        elif [ -n "${HOME:-}" ]; then
+            mkdir -p "$HOME/.local/share/easytier" || return 1
+            : > "$HOME/.local/share/easytier/.legacy-machine-id-migration"
+        fi
+    fi
+    msg_info "$(t "Prepared legacy Web machine-ID migration for this upgrade" "已为本次升级准备旧版 Web 机器 ID 迁移")"
+}
+
 _write_core_args() {
-    mkdir -p /etc/easytier "$ET_FILE_LOG_DIR" 2>/dev/null || true
-    local _tmp="/etc/easytier/core.args.tmp.$$"
+    local _rc=0
+    _select_machine_id || _rc=$?
+    [ "$_rc" -ne 2 ] || {
+        msg_err "$(t "Refusing to rewrite core.args: $_MACHINE_ID_ERROR" "拒绝重写 core.args：$_MACHINE_ID_ERROR")"
+        return 1
+    }
+
+    mkdir -p "$(dirname "$ET_CORE_ARGS_FILE")" "$ET_FILE_LOG_DIR" 2>/dev/null || true
+    local _tmp="${ET_CORE_ARGS_FILE}.tmp.$$"
     crit_begin
-    printf '%s\n' \
+    {
+      printf '%s\n' \
         "$1" "$2" \
         "--file-log-dir"   "$ET_FILE_LOG_DIR" \
         "--file-log-level" "$ET_FILE_LOG_LEVEL" \
         "--file-log-size"  "$ET_FILE_LOG_SIZE" \
-        "--file-log-count" "$ET_FILE_LOG_COUNT" \
-        > "$_tmp"
-    _commit_tmp "$_tmp" /etc/easytier/core.args 600
+        "--file-log-count" "$ET_FILE_LOG_COUNT"
+      [ "$_rc" -eq 0 ] && printf '%s\n' "--machine-id" "$_SELECTED_MACHINE_ID"
+    } > "$_tmp"
+    _commit_tmp "$_tmp" "$ET_CORE_ARGS_FILE" 600
     crit_end
 }
 

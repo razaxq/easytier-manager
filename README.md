@@ -38,6 +38,7 @@ ET_LANG=en sh easytier.sh    # 强制英文
 - 🛡  **服务加固** —— systemd 单元默认启用 `NoNewPrivileges`/`ProtectSystem` 等沙箱项（保证 TUN/转发不受影响）
 - 📦  **版本备份** —— 更新时可选保留旧二进制（默认不保留；保留时按数量自动轮换，配置备份同步轮转）
 - 📋  **日志管理** —— 脚本操作日志写入 `/var/log/easytier-manager.log`；自动配置 core 文件日志大小与轮转，避免日志填满磁盘
+- 🪪  **升级身份兼容** —— Web 模式升级或重配时保留机器 ID，避免控制台把原节点误识别为新设备并隐藏原网络配置
 - 🪶  **小闪存友好** —— 仅安装必需二进制（默认跳过 `easytier-web` GUI 与未启用的 `easytier-web-embed`）；procd 下日志/备份默认值自动收紧；下载与安装前进行磁盘空间预检
 
 ---
@@ -152,6 +153,7 @@ sh easytier.sh help       # 帮助
 | `ET_PEERS` | 逗号分隔 Peer 列表 | `tcp://a:11010,udp://b:11010` |
 | `ET_PROXY_CIDR` | 子网代理 CIDR（可多个，逗号分隔） | `192.168.1.0/24,10.9.0.0/24` |
 | `ET_WEB_URL` | Web 模式接入 URL | `udp://host:22020/user` |
+| `ET_MACHINE_ID` | 固定 Web 控制台机器 ID；通常无需设置，脚本会自动迁移/保留（可用 UUID 或不含空白的稳定字符串） | `cad9ff67-...` |
 | `ET_BACKUP_KEEP` | 每个二进制 / 配置保留的备份份数（非交互下 `0` = 不备份） | `3`（默认；procd 下 `1`） |
 | `ET_RELEASES_COUNT` | 版本列表最多条数 | `20`（默认） |
 | `ET_INSTALL_WEB_GUI` | `1` 时安装 `easytier-web` GUI 客户端 | `0`（默认不装） |
@@ -180,6 +182,7 @@ sh easytier.sh help       # 帮助
 | `/etc/easytier/config.toml` | TOML 模式配置 |
 | `/etc/easytier/core.args` | core 启动参数 |
 | `/etc/easytier/web.args` | web-embed 启动参数 |
+| `/var/lib/easytier/machine_id` | EasyTier 持久化机器 ID（systemd 默认；若服务保留 `HOME`/`XDG_DATA_HOME`，则位于对应数据目录） |
 | `/etc/systemd/system/easytier.service` 等 | 服务单元（按 init 系统） |
 | `/var/log/easytier-manager.log` | 脚本自身日志 |
 | `/var/log/easytier/` | easytier-core 文件日志（按大小轮转，OpenWrt 上落在 tmpfs） |
@@ -194,6 +197,7 @@ sh easytier.sh help       # 帮助
 
 ```sh
 shellcheck -s sh easytier.sh
+sh tests/test_machine_id.sh
 ```
 
 CI 会在每次 push / PR 时对所有 `*.sh` 跑 ShellCheck（见 [`.github/workflows/shellcheck.yml`](.github/workflows/shellcheck.yml)）。
@@ -215,6 +219,9 @@ A: 卸载流程会**分步**询问是否删除备份和 `/etc/easytier`，默认
 
 **Q: 如何升级到新版？**
 A: 主菜单选 `6) 更新 / 重装`，脚本会拉取最新 Release 列表。「仅更新二进制」保留现有配置。
+
+**Q: 为什么升级后 Web 控制台中的原网络配置不见了？**
+A: Web 控制台按机器 ID 关联节点和配置。旧版 EasyTier 到新版的默认 ID 算法曾发生兼容迁移；脚本从 v2.6.1 起会在替换二进制前触发旧 ID 迁移，并在重配时保留 `--machine-id`。若节点已发生过 ID 变化，需要先从控制台或备份找回旧 ID，再以 `ET_MACHINE_ID=<旧ID> sh easytier.sh` 重配一次。
 
 ---
 
