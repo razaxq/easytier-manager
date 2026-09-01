@@ -39,12 +39,6 @@ sudo env ET_LANG=zh sh easytier.sh
 > 需要 `curl` 与 `unzip`；缺失时脚本会提示对应安装命令。
 > 中文环境下 `sudo sh easytier.sh` 也会自动显示中文，`ET_LANG=zh` 用于在英文 / `C` locale 的主机上强制中文。
 
-jsDelivr 对 `@main` 的 CDN 缓存为 12 小时，刚发布的修复可能有延迟。想立刻拿到最新版就直连 GitHub：
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/razaxq/easytier-manager/main/easytier.sh -o easytier.sh
-```
-
 子命令（执行后即退出，无参数则进入菜单）：
 
 ```sh

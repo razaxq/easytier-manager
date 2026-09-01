@@ -38,13 +38,6 @@ sudo sh easytier.sh
 
 > Requires `curl` and `unzip`; the script prints the matching install command if either is missing.
 
-jsDelivr caches `@main` for 12 hours, so a just-released fix may lag. To get the newest revision
-right away, fetch it straight from GitHub:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/razaxq/easytier-manager/main/easytier.sh -o easytier.sh
-```
-
 Subcommands (run and exit; no argument opens the menu):
 
 ```sh
