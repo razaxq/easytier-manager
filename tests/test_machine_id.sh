@@ -86,6 +86,19 @@ cmp -s "$ET_CORE_ARGS_FILE" "$TEST_DIR/core.args.before" || \
 pass 'a malformed existing machine-ID option blocks a destructive rewrite'
 
 reset_inputs
+printf '%s\n' -w udp://old.example/user --machine-id --file-log-dir "$TEST_DIR/old-log" \
+    > "$ET_CORE_ARGS_FILE"
+cp "$ET_CORE_ARGS_FILE" "$TEST_DIR/core.args.before"
+set +e
+_write_core_args -w udp://new.example/user >/dev/null 2>&1
+OPTION_VALUE_RC=$?
+set -e
+[ "$OPTION_VALUE_RC" -ne 0 ] || fail 'an option was accepted as a machine ID value'
+cmp -s "$ET_CORE_ARGS_FILE" "$TEST_DIR/core.args.before" || \
+    fail 'option-like machine ID overwrote core.args'
+pass 'an option after --machine-id is rejected as a missing value'
+
+reset_inputs
 printf '%s\n' \
     '[Service]' \
     "ExecStart=/usr/bin/easytier-core -w udp://old/user --machine-id=$MID_ARGS" \
@@ -96,6 +109,31 @@ assert_line_pair --machine-id "$MID_ARGS" "$ET_CORE_ARGS_FILE" \
 pass 'identity is recovered from a legacy service file'
 
 reset_inputs
+printf '%s\n' \
+    '[Service]' \
+    'ExecStart=/usr/bin/easytier-core -w udp://old/user --machine-id --file-log-dir /tmp/log' \
+    > "$ET_CORE_SERVICE_FILE"
+set +e
+_write_core_args -w udp://new.example/user >/dev/null 2>&1
+SERVICE_VALUE_RC=$?
+set -e
+[ "$SERVICE_VALUE_RC" -ne 0 ] || fail 'a service option was accepted as a machine ID value'
+[ ! -f "$ET_CORE_ARGS_FILE" ] || fail 'malformed service identity created core.args'
+pass 'a malformed service machine-ID option blocks configuration rewrite'
+
+reset_inputs
+mkdir -p "$(dirname "$ET_MACHINE_ID_STATE_FILE")"
+printf '%s\n' not-a-uuid > "$ET_MACHINE_ID_STATE_FILE"
+printf '%s\n' --config-file /etc/easytier/config.toml > "$ET_CORE_ARGS_FILE"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$ET_CORE_BIN_FILE"
+chmod +x "$ET_CORE_BIN_FILE"
+_prepare_machine_id_upgrade >/dev/null
+_write_core_args --config-file /etc/easytier/config.toml
+grep -q -- '--machine-id' "$ET_CORE_ARGS_FILE" && \
+    fail 'non-Web configuration imported a Web machine ID'
+pass 'non-Web install and configuration ignore Web machine-ID state'
+
+reset_inputs
 printf '%s\n' '#!/bin/sh' 'exit 0' > "$ET_CORE_BIN_FILE"
 chmod +x "$ET_CORE_BIN_FILE"
 printf '%s\n' -w udp://old.example/user > "$ET_CORE_ARGS_FILE"
@@ -104,4 +142,4 @@ _prepare_machine_id_upgrade >/dev/null
     fail 'legacy migration marker was not created before binary replacement'
 pass 'legacy Web upgrades prime the upstream 2.4.x identity migration'
 
-printf '1..7\n'
+printf '1..10\n'

@@ -1135,10 +1135,12 @@ _prune_backups() {
 # ==============================================================================
 
 # A command-line machine ID may be a UUID or a stable string (EasyTier hashes the latter).
-# Whitespace cannot be represented safely by every supported init system, so reject it here.
+# Reject whitespace and option-like values so every supported init system represents it safely.
 _machine_id_arg_valid() {
     [ -n "${1:-}" ] || return 1
-    case "$1" in *[[:space:]]*) return 1 ;; esac
+    # A separate CLI option cannot safely represent a value that starts with "-";
+    # treating it as an ID would also hide a missing --machine-id value.
+    case "$1" in -*|*[[:space:]]*) return 1 ;; esac
     return 0
 }
 
@@ -1154,12 +1156,21 @@ _machine_id_from_args() {
     [ -f "$_file" ] || return 1
     local _value
     _value=$(awk '
-        _next { _next=0; if (length($0)) { print; exit } else { exit 2 } }
+        _next {
+            _next=0
+            if (length($0) && $0 !~ /^-/) { print; exit }
+            exit 2
+        }
         $0 == "--machine-id" { _next=1; next }
-        /^--machine-id=/ { sub(/^--machine-id=/, ""); if (length($0)) print; else exit 2; exit }
+        /^--machine-id=/ {
+            sub(/^--machine-id=/, "")
+            if (length($0) && $0 !~ /^-/) print; else exit 2
+            exit
+        }
         END { if (_next) exit 2 }
     ' "$_file") || return $?
     [ -n "$_value" ] || return 1
+    _machine_id_arg_valid "$_value" || return 2
     printf '%s\n' "$_value"
 }
 
@@ -1171,13 +1182,21 @@ _machine_id_from_service() {
     _value=$(awk '
         {
             for (i=1; i<=NF; i++) {
-                if ($i == "--machine-id" && i < NF) { print $(i+1); exit }
-                if ($i ~ /^--machine-id=/) { sub(/^--machine-id=/, "", $i); print $i; exit }
+                if ($i == "--machine-id") {
+                    if (i < NF && $(i+1) !~ /^-/) print $(i+1); else exit 2
+                    exit
+                }
+                if ($i ~ /^--machine-id=/) {
+                    sub(/^--machine-id=/, "", $i)
+                    if (length($i) && $i !~ /^-/) print $i; else exit 2
+                    exit
+                }
             }
         }
-    ' "$ET_CORE_SERVICE_FILE")
+    ' "$ET_CORE_SERVICE_FILE") || return $?
     _value=$(printf '%s\n' "$_value" | sed "s/^[\"']\\|[\"']$//g")
     [ -n "$_value" ] || return 1
+    _machine_id_arg_valid "$_value" || return 2
     printf '%s\n' "$_value"
 }
 
@@ -1201,8 +1220,14 @@ _select_machine_id() {
     fi
 
     if [ -z "$_source" ] && [ -f "$ET_CORE_SERVICE_FILE" ]; then
-        _candidate=$(_machine_id_from_service) || true
-        [ -n "$_candidate" ] && _source="$ET_CORE_SERVICE_FILE"
+        _read_rc=0
+        _candidate=$(_machine_id_from_service) || _read_rc=$?
+        if [ "$_read_rc" -eq 0 ]; then
+            _source="$ET_CORE_SERVICE_FILE"
+        elif [ "$_read_rc" -eq 2 ]; then
+            _MACHINE_ID_ERROR="Malformed --machine-id in $ET_CORE_SERVICE_FILE"
+            return 2
+        fi
     fi
 
     if [ -z "$_source" ] && [ -f "$ET_MACHINE_ID_STATE_FILE" ]; then
@@ -1224,7 +1249,7 @@ _select_machine_id() {
     fi
 
     _machine_id_arg_valid "$_candidate" || {
-        _MACHINE_ID_ERROR="Invalid machine ID in $_source (must be non-empty and contain no whitespace)"
+        _MACHINE_ID_ERROR="Invalid machine ID in $_source (must be non-empty, contain no whitespace, and not start with '-')"
         return 2
     }
     _SELECTED_MACHINE_ID="$_candidate"
@@ -1237,16 +1262,16 @@ _select_machine_id() {
 # first start instead of silently registering as a new machine.
 _prepare_machine_id_upgrade() {
     local _rc=0 _first=""
+    [ -x "$ET_CORE_BIN_FILE" ] || return 0
+    [ -f "$ET_CORE_ARGS_FILE" ] || return 0
+    _first=$(sed -n '1p' "$ET_CORE_ARGS_FILE" 2>/dev/null)
+    [ "$_first" = "-w" ] || [ "$_first" = "--config-server" ] || return 0
+
     _select_machine_id || _rc=$?
     case "$_rc" in
         0) return 0 ;;
         2) msg_err "$(t "Cannot preserve EasyTier machine identity: $_MACHINE_ID_ERROR" "无法保留 EasyTier 机器身份：$_MACHINE_ID_ERROR")"; return 1 ;;
     esac
-
-    [ -x "$ET_CORE_BIN_FILE" ] || return 0
-    [ -f "$ET_CORE_ARGS_FILE" ] || return 0
-    _first=$(sed -n '1p' "$ET_CORE_ARGS_FILE" 2>/dev/null)
-    [ "$_first" = "-w" ] || [ "$_first" = "--config-server" ] || return 0
 
     local _state_dir
     _state_dir=$(dirname "$ET_MACHINE_ID_STATE_FILE")
@@ -1267,12 +1292,17 @@ _prepare_machine_id_upgrade() {
 }
 
 _write_core_args() {
-    local _rc=0
-    _select_machine_id || _rc=$?
-    [ "$_rc" -ne 2 ] || {
-        msg_err "$(t "Refusing to rewrite core.args: $_MACHINE_ID_ERROR" "拒绝重写 core.args：$_MACHINE_ID_ERROR")"
-        return 1
-    }
+    local _rc=1
+    case "$1" in
+        -w|--config-server)
+            _rc=0
+            _select_machine_id || _rc=$?
+            [ "$_rc" -ne 2 ] || {
+                msg_err "$(t "Refusing to rewrite core.args: $_MACHINE_ID_ERROR" "拒绝重写 core.args：$_MACHINE_ID_ERROR")"
+                return 1
+            }
+            ;;
+    esac
 
     mkdir -p "$(dirname "$ET_CORE_ARGS_FILE")" "$ET_FILE_LOG_DIR" 2>/dev/null || true
     local _tmp="${ET_CORE_ARGS_FILE}.tmp.$$"

@@ -153,7 +153,7 @@ sh easytier.sh help       # 帮助
 | `ET_PEERS` | 逗号分隔 Peer 列表 | `tcp://a:11010,udp://b:11010` |
 | `ET_PROXY_CIDR` | 子网代理 CIDR（可多个，逗号分隔） | `192.168.1.0/24,10.9.0.0/24` |
 | `ET_WEB_URL` | Web 模式接入 URL | `udp://host:22020/user` |
-| `ET_MACHINE_ID` | 固定 Web 控制台机器 ID；通常无需设置，脚本会自动迁移/保留（可用 UUID 或不含空白的稳定字符串） | `cad9ff67-...` |
+| `ET_MACHINE_ID` | 固定 Web 控制台机器 ID；通常无需设置，脚本会自动迁移/保留（可用 UUID 或不含空白且不以 `-` 开头的稳定字符串） | `cad9ff67-...` |
 | `ET_BACKUP_KEEP` | 每个二进制 / 配置保留的备份份数（非交互下 `0` = 不备份） | `3`（默认；procd 下 `1`） |
 | `ET_RELEASES_COUNT` | 版本列表最多条数 | `20`（默认） |
 | `ET_INSTALL_WEB_GUI` | `1` 时安装 `easytier-web` GUI 客户端 | `0`（默认不装） |
