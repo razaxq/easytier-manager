@@ -211,6 +211,11 @@ msg_err()  { printf "${C_RED}  ✗${C_RST}  %s\n"  "$*" >&2; _log "ERR" "$*"; }
 msg_info() { printf "${C_CYN}  ›${C_RST}  %s\n"  "$*"; }
 die()      { msg_err "$*"; exit 1; }
 
+# Print a runnable command with its label as a trailing shell comment, so selecting
+# the whole line and pasting it still works. A "label : command" layout does not:
+# the shell then tries to run the label.  $1 command  $2 label
+_cmd_hint() { printf "    %-38s ${C_DIM}# %s${C_RST}\n" "$1" "$2"; }
+
 # Section heading
 section() {
     local title="$1"
@@ -2437,8 +2442,18 @@ do_view_status() {
                 shown=1
             fi
         done
+        # Empty peer/route output has two very different causes. Probe the RPC
+        # portal itself so the hint names the right one instead of always
+        # blaming the portal — in Web mode "no network yet" is the common case.
         if [ "$shown" = "0" ]; then
-            msg_info "$(t "easytier-cli returned nothing — the core may be using a different RPC portal than $(_rpc_portal_addr); reconfigure to pin it" "easytier-cli 无输出——core 使用的 RPC 端口可能不是 $(_rpc_portal_addr)；重新配置即可固定")"
+            if [ -n "$(_cli node)" ]; then
+                msg_info "$(t "RPC portal reachable but no network is running" "RPC 端口可达，但当前没有运行中的网络")"
+                if [ "$(sed -n '1p' "$ET_CORE_ARGS_FILE" 2>/dev/null)" = "-w" ]; then
+                    msg_info "$(t "Web mode: the console has not pushed a config to this node yet — check that it appears in the console and has a network assigned" "Web 模式：控制台尚未向本节点下发配置——请确认控制台里能看到本设备并已为其分配网络")"
+                fi
+            else
+                msg_info "$(t "easytier-cli cannot reach the RPC portal at $(_rpc_portal_addr); reconfigure to pin it" "easytier-cli 连不上 RPC 端口 $(_rpc_portal_addr)；重新配置即可固定")"
+            fi
         fi
         printf '\n'
     fi
@@ -2446,21 +2461,21 @@ do_view_status() {
     printf "  ${C_BLD}[ $(t "Log commands" "日志命令") ]${C_RST}\n"
     case "$INIT_SYS" in
         procd)
-            printf "    easytier-core : logread -f | grep easytier\n"
-            printf "    easytier-web  : logread -f | grep easytier-web\n"
+            _cmd_hint "logread -f | grep easytier"     "easytier-core"
+            _cmd_hint "logread -f | grep easytier-web" "easytier-web"
             ;;
         systemd)
-            printf "    easytier-core : journalctl -u easytier -f\n"
+            _cmd_hint "journalctl -u easytier -f" "easytier-core"
             [ -f /etc/systemd/system/easytier-web.service ] && \
-                printf "    easytier-web  : journalctl -u easytier-web -f\n"
+                _cmd_hint "journalctl -u easytier-web -f" "easytier-web"
             ;;
         openrc)
-            printf "    easytier-core : tail -f /var/log/easytier.log\n"
+            _cmd_hint "tail -f /var/log/easytier.log" "easytier-core"
             [ -f /etc/init.d/easytier-web ] && \
-                printf "    easytier-web  : tail -f /var/log/easytier-web.log\n"
+                _cmd_hint "tail -f /var/log/easytier-web.log" "easytier-web"
             ;;
     esac
-    printf "    $(t "Install log  " "安装日志     ") : %s\n" "$LOG_FILE"
+    _cmd_hint "tail -f ${LOG_FILE}" "$(t "manager log" "脚本自身日志")"
     return "$_status_rc"
 }
 
@@ -2611,12 +2626,13 @@ show_file_locations() {
             "$ET_FILE_LOG_DIR" "${cur_log_size:-?}" \
             "$ET_FILE_LOG_SIZE" "$ET_FILE_LOG_COUNT" "$ET_FILE_LOG_LEVEL"
     fi
+    printf "  $(t "Runtime log" "运行日志"):\n"
     case "$INIT_SYS" in
-        procd)   printf "  $(t "Runtime log" "运行日志"): logread -f | grep easytier\n" ;;
-        systemd) printf "  $(t "Runtime log" "运行日志"): journalctl -u easytier -f\n"
+        procd)   _cmd_hint "logread -e easytier" "easytier-core" ;;
+        systemd) _cmd_hint "journalctl -u easytier -f" "easytier-core"
                  [ -f /etc/systemd/system/easytier-web.service ] && \
-                     printf "            journalctl -u easytier-web -f\n" ;;
-        openrc)  printf "  $(t "Runtime log" "运行日志"): tail -f /var/log/easytier.log\n" ;;
+                     _cmd_hint "journalctl -u easytier-web -f" "easytier-web" ;;
+        openrc)  _cmd_hint "tail -f /var/log/easytier.log" "easytier-core" ;;
     esac
 
     # old versions (< 2.1.0) without --file-log-dir wrote 100MB×10 logs to cwd
