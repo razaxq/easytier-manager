@@ -61,7 +61,6 @@ Edit the values, then run the whole block. `sudo env` is used rather than `sudo 
 curl -fsSL https://raw.githubusercontent.com/razaxq/easytier-manager/main/easytier.sh -o easytier.sh
 sudo env \
   ET_NONINTERACTIVE=1 \
-  ET_LANG=en \
   ET_MODE=toml \
   ET_INSTANCE_NAME=mynode \
   ET_VIRTUAL_IP=10.0.0.1/24 \
