@@ -1,0 +1,33 @@
+name: Upstream compatibility
+
+on:
+  pull_request:
+    paths:
+      - 'easytier.sh'
+      - 'tests/test_upstream_compat.sh'
+      - '.github/workflows/upstream-compat.yml'
+  push:
+    branches: [main, master]
+    paths:
+      - 'easytier.sh'
+      - 'tests/test_upstream_compat.sh'
+      - '.github/workflows/upstream-compat.yml'
+  schedule:
+    - cron: '23 3 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  latest-stable:
+    name: Latest stable EasyTier
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Verify release assets, CLI, and generated config
+        env:
+          ET_GITHUB_TOKEN: ${{ github.token }}
+        run: sh tests/test_upstream_compat.sh

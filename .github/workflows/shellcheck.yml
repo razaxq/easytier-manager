@@ -17,13 +17,18 @@ jobs:
     name: Lint shell scripts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Run ShellCheck
-        uses: ludeeus/action-shellcheck@master
+        uses: ludeeus/action-shellcheck@00b27aa7cb85167568cb48a3838b75f4265f2bca # master, pinned 2026-09-01
         env:
           SHELLCHECK_OPTS: -s sh -e SC3043 -e SC2086 -e SC2059 -e SC2155
         with:
           scandir: '.'
           severity: warning
           format: gcc
+
+      - name: Run unit tests
+        run: |
+          sh tests/test_machine_id.sh
+          sh tests/test_manager.sh
