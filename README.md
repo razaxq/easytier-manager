@@ -32,11 +32,14 @@ An interactive script to **install, configure and manage [EasyTier](https://gith
 ## 🚀 Quick start
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/razaxq/easytier-manager/main/easytier.sh -o easytier.sh
+curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh -o easytier.sh
 sudo sh easytier.sh
 ```
 
 > Requires `curl` and `unzip`; the script prints the matching install command if either is missing.
+> jsDelivr caches `@main` for 12 hours, so a just-released fix may lag. For the newest revision use
+> `https://raw.githubusercontent.com/razaxq/easytier-manager/main/easytier.sh`, or purge via
+> `https://purge.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh`.
 
 Subcommands (run and exit; no argument opens the menu):
 
@@ -58,7 +61,7 @@ Edit the values, then run the whole block. `sudo env` is used rather than `sudo 
 **Standalone node (TOML mode)**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/razaxq/easytier-manager/main/easytier.sh -o easytier.sh
+curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh -o easytier.sh
 sudo env \
   ET_NONINTERACTIVE=1 \
   ET_MODE=toml \
