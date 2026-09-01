@@ -159,6 +159,19 @@ is_safe_arg_value 'udp://h:22020/my%20user' || fail 'a percent-encoded URL was r
 ! is_safe_arg_value 'http://x".example.com' || fail 'a double quote was accepted'
 pass 'shell metacharacters cannot reach a generated service file'
 
+# POSIX `read` has no line editing: an arrow key inserts a raw ESC [ C sequence
+# that is invisible in the terminal and in `cat`, so it must never validate.
+ESC_SEQ=$(printf '\033[C')
+! is_valid_url "wss://easytier-cfg.example.com/user${ESC_SEQ}" || \
+    fail 'a join URL carrying an arrow-key escape sequence was accepted'
+! is_safe_arg_value "http://example.com${ESC_SEQ}" || \
+    fail 'control characters could reach a service file'
+! is_printable_text "mynode${ESC_SEQ}" || fail 'control characters passed the text check'
+is_printable_text 'my node-01_x' || fail 'ordinary text was rejected'
+_warn_ctrl_input "x${ESC_SEQ}" >/dev/null || fail 'control input did not raise the arrow-key hint'
+! _warn_ctrl_input 'clean-value' >/dev/null || fail 'clean input raised the arrow-key hint'
+pass 'stray escape sequences are rejected instead of entering the config'
+
 is_valid_http_url 'https://console.example.com' || fail 'a valid api-host was rejected'
 ! is_valid_http_url 'udp://console.example.com' || fail 'a non-http api-host was accepted'
 ! is_valid_http_url 'http://$(reboot).example.com' || fail 'an injected api-host was accepted'

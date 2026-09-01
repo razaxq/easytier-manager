@@ -565,6 +565,22 @@ is_safe_arg_value() {
     case "${1:-}" in
         '') return 1 ;;
         *[[:space:]]*|*'$'*|*'`'*|*'\'*|*'"'*|*"'"*) return 1 ;;
+        # POSIX `read` has no line editing: an arrow key inserts a raw escape
+        # sequence (ESC [ C) that is invisible in the terminal and in `cat`, yet
+        # would travel all the way into the service file.
+        *[[:cntrl:]]*) return 1 ;;
+    esac
+    return 0
+}
+
+# Free-form text destined for config.toml. Unlike is_safe_arg_value this allows
+# shell metacharacters — _toml_escape quotes them — but raw control characters
+# are not representable in a TOML basic string and are almost always a stray
+# escape sequence from an arrow key.
+is_printable_text() {
+    case "${1:-}" in
+        '') return 1 ;;
+        *[[:cntrl:]]*) return 1 ;;
     esac
     return 0
 }
@@ -704,6 +720,29 @@ _toml_escape() {
             first = 0
         }
     '
+}
+
+# POSIX `read` has no line editing, so arrow keys insert a raw escape sequence
+# instead of moving the cursor — invisible in the terminal and in `cat`. Say so
+# explicitly; returns 0 when it warned, so callers can skip their generic message.
+_warn_ctrl_input() {
+    is_printable_text "$1" && return 1
+    msg_warn "$(t "Input contains control characters — arrow keys do not work here" "输入包含控制字符——此处方向键不可用")"
+    msg_info "$(t "Press Ctrl+U to clear the line, then retype (Backspace and Ctrl+W do work)" "请按 Ctrl+U 清空整行后重新输入（退格键和 Ctrl+W 可用）")"
+    return 0
+}
+
+# Prompt for one free-form line, rejecting a stray escape sequence instead of
+# letting it reach the generated config. Result in _READ_TEXT (may be empty —
+# each caller applies its own default).
+_read_text() {
+    while true; do
+        printf '%s' "$1"
+        read -r _READ_TEXT
+        [ -z "$_READ_TEXT" ] && return 0
+        is_printable_text "$_READ_TEXT" && return 0
+        _warn_ctrl_input "$_READ_TEXT"
+    done
 }
 
 # Yes/No prompt with a default. $1 prompt  $2 default(y|n) → return 0 = yes, 1 = no
@@ -1807,11 +1846,14 @@ _toml_wizard() {
     # ── Node instance name ────────────────────────────────────
     local def_name
     def_name="${ET_INSTANCE_NAME:-$(hostname 2>/dev/null || echo "easytier-node")}"
-    printf "$(t "  Node instance name  [default: %s]: " "  节点实例名  [默认: %s]: ")" "$def_name"
-    [ "${ET_NONINTERACTIVE:-0}" = "1" ] && printf '\n' && _TOML_INSTANCE="$def_name" || {
-        read -r _TOML_INSTANCE
+    if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
+        printf "$(t "  Node instance name  [default: %s]: \n" "  节点实例名  [默认: %s]: \n")" "$def_name"
+        _TOML_INSTANCE="$def_name"
+    else
+        _read_text "$(printf "$(t "  Node instance name  [default: %s]: " "  节点实例名  [默认: %s]: ")" "$def_name")"
+        _TOML_INSTANCE="$_READ_TEXT"
         [ -z "$_TOML_INSTANCE" ] && _TOML_INSTANCE="$def_name"
-    }
+    fi
 
     # ── DHCP vs fixed virtual IP ──────────────────────────
     _TOML_DHCP="${ET_DHCP:-0}"
@@ -1863,23 +1905,24 @@ _toml_wizard() {
     # ── Network name ──────────────────────────────────────
     local def_net="${ET_NETWORK_NAME:-}"
     while true; do
-        printf '%s' "$(t "  Network name    [any string]: " "  网络名称    [自定义字符串]: ")"
         if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
+            printf '%s' "$(t "  Network name    [any string]: " "  网络名称    [自定义字符串]: ")"
             [ -n "$def_net" ] || die "$(t "Non-interactive mode requires ET_NETWORK_NAME" "非交互模式需设置 ET_NETWORK_NAME")"
             printf '%s\n' "$def_net"; _TOML_NET_NAME="$def_net"; break
         fi
-        read -r _TOML_NET_NAME
+        _read_text "$(t "  Network name    [any string]: " "  网络名称    [自定义字符串]: ")"
+        _TOML_NET_NAME="$_READ_TEXT"
         [ -n "$_TOML_NET_NAME" ] && break
         msg_warn "$(t "Network name cannot be empty" "网络名称不能为空")"
     done
 
     # ── Network secret ──────────────────────────────────────
-    printf '%s' "$(t "  Network secret    [empty = auto-generate]: " "  网络密钥    [留空=自动生成]: ")"
     if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
-        printf '\n'
+        printf '%s\n' "$(t "  Network secret    [empty = auto-generate]: " "  网络密钥    [留空=自动生成]: ")"
         _TOML_NET_SECRET="${ET_NETWORK_SECRET:-}"
     else
-        read -r _TOML_NET_SECRET
+        _read_text "$(t "  Network secret    [empty = auto-generate]: " "  网络密钥    [留空=自动生成]: ")"
+        _TOML_NET_SECRET="$_READ_TEXT"
     fi
     if [ -z "$_TOML_NET_SECRET" ]; then
         _TOML_NET_SECRET=$(gen_secret)
@@ -1947,8 +1990,8 @@ _toml_wizard() {
     case "$ET_DATA_COMPRESS_ALGO" in 0|1|2) _TOML_COMPRESS="$ET_DATA_COMPRESS_ALGO" ;; *) _TOML_COMPRESS=0 ;; esac
     if [ "${ET_NONINTERACTIVE:-0}" != "1" ]; then
         if _ask_flag "$(t "  Configure advanced options (device name, encryption…)? [y/N]: " "  配置高级选项（设备名、加密…）? [y/N]: ")" n; then
-            printf "$(t "  TUN device name [default %s]: " "  TUN 设备名 [默认 %s]: ")" "$_TOML_DEV_NAME"
-            local _dn; read -r _dn; [ -n "$_dn" ] && _TOML_DEV_NAME="$_dn"
+            _read_text "$(printf "$(t "  TUN device name [default %s]: " "  TUN 设备名 [默认 %s]: ")" "$_TOML_DEV_NAME")"
+            [ -n "$_READ_TEXT" ] && _TOML_DEV_NAME="$_READ_TEXT"
             _ask_flag "$(t "  Enable encryption? [Y/n]: " "  启用加密? [Y/n]: ")" y \
                 && _TOML_ENC=true || _TOML_ENC=false
             _ask_flag "$(t "  Private mode (reject foreign networks)? [Y/n]: " "  私有模式（拒绝陌生网络）? [Y/n]: ")" y \
@@ -2284,7 +2327,8 @@ ask_core_web_url() {
                 ;;
             *)
                 if ! is_valid_url "$w_url"; then
-                    msg_warn "$(t "URL must start with tcp:// udp:// ws:// wss://" "URL 须以 tcp:// udp:// ws:// wss:// 开头")"
+                    _warn_ctrl_input "$w_url" || \
+                        msg_warn "$(t "URL must start with tcp:// udp:// ws:// wss://" "URL 须以 tcp:// udp:// ws:// wss:// 开头")"
                     continue
                 fi
                 _write_core_args "-w" "$w_url" || return 1
