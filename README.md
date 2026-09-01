@@ -85,7 +85,7 @@ sudo env \
 Optional additions to either block — a download mirror, a pinned version, and letting this node act as an exit node:
 
 ```sh
-  ET_GITHUB_MIRROR=https://ghproxy.com \
+  ET_GITHUB_MIRROR=https://ghfast.top \
   ET_VERSION=v2.6.4 \
   ET_ENABLE_EXIT_NODE=1 \
 ```
@@ -118,7 +118,8 @@ Optional additions to either block — a download mirror, a pinned version, and 
 | `ET_ALLOW_VERSION_FALLBACK` / `ET_DEFAULT_VERSION` | Allow falling back to a fixed version when the API fails and nothing is installed | `0` / `v2.6.4` |
 | `ET_SHA256` | Set the zip's SHA-256 manually; otherwise the official digest is fetched | automatic |
 | `ET_ALLOW_UNVERIFIED` | `1` = continue when the SHA-256 cannot be fetched or computed (not recommended) | `0` |
-| `ET_GITHUB_MIRROR` | Download prefix mirror | empty |
+| `ET_GITHUB_MIRROR` | Download prefix mirror; tried first, with github.com as the last resort | empty |
+| `ET_GITHUB_MIRRORS` | Fallback prefixes tried in order after a direct attempt fails; empty disables the fallback | `https://ghfast.top https://gh-proxy.com` |
 | `ET_GITHUB_API` / `ET_GITHUB_TOKEN` | API base / PAT (lifts the 60-per-hour anonymous limit) | official / empty |
 | `ET_CACHE_TTL` | Seconds to cache the release list (`0` disables) | `600` |
 | `ET_MIN_TMP_MB` | Minimum free space in `/tmp` for download + extract (MB) | `120` |

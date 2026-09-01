@@ -172,6 +172,27 @@ _warn_ctrl_input "x${ESC_SEQ}" >/dev/null || fail 'control input did not raise t
 ! _warn_ctrl_input 'clean-value' >/dev/null || fail 'clean input raised the arrow-key hint'
 pass 'stray escape sequences are rejected instead of entering the config'
 
+# Download sources: github.com stays in the list either way, because the digest
+# lookup needs api.github.com regardless, and a mirror can never substitute the
+# payload (the expected SHA-256 does not come from the mirror).
+REL_URL='https://github.com/EasyTier/EasyTier/releases/download/v2.6.4/x.zip'
+ET_GITHUB_MIRROR=''
+ET_GITHUB_MIRRORS='https://m1.example.com https://m2.example.com/'
+assert_eq "$REL_URL
+https://m1.example.com/$REL_URL
+https://m2.example.com/$REL_URL" "$(_download_urls "$REL_URL")" \
+    'without an explicit mirror, github.com is tried first and mirrors follow'
+
+ET_GITHUB_MIRROR='https://explicit.example.com/'
+assert_eq "https://explicit.example.com/$REL_URL
+$REL_URL" "$(_download_urls "$REL_URL")" \
+    'an explicit mirror goes first, with github.com as the last resort'
+
+ET_GITHUB_MIRROR=''
+ET_GITHUB_MIRRORS=''
+assert_eq "$REL_URL" "$(_download_urls "$REL_URL")" \
+    'an empty mirror list disables the fallback'
+
 is_valid_http_url 'https://console.example.com' || fail 'a valid api-host was rejected'
 ! is_valid_http_url 'udp://console.example.com' || fail 'a non-http api-host was accepted'
 ! is_valid_http_url 'http://$(reboot).example.com' || fail 'an injected api-host was accepted'

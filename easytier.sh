@@ -49,7 +49,8 @@
 #    ET_ALLOW_PRERELEASE=1                 — allow auto-selection of a pre-release
 #    ET_ALLOW_VERSION_FALLBACK=1           — allow ET_DEFAULT_VERSION when the release API fails
 #    ET_DEFAULT_VERSION=v2.6.4             — explicit fallback version (disabled by default)
-#    ET_GITHUB_MIRROR=https://ghproxy.com  — prefix mirror for github.com downloads (helps in CN)
+#    ET_GITHUB_MIRROR=https://ghfast.top   — prefix mirror for github.com downloads (helps in CN)
+#    ET_GITHUB_MIRRORS='<p1> <p2>'         — fallback prefixes tried after github.com (empty = off)
 #    ET_GITHUB_API=https://api.github.com  — GitHub API base override (for an API mirror)
 #    ET_GITHUB_TOKEN=<PAT>                 — lift the 60/h anonymous API rate limit (or GITHUB_TOKEN)
 #    ET_SHA256=<hex>                       — expected sha256 of the release zip (integrity check)
@@ -92,6 +93,11 @@ TMP_DIR="/tmp/et_mgr_$$"
 ET_GITHUB_API="${ET_GITHUB_API:-https://api.github.com}"   # API base (override for a mirror)
 ET_GITHUB_DIGEST_API="https://api.github.com"                         # trusted release-digest API (not mirrorable)
 ET_GITHUB_MIRROR="${ET_GITHUB_MIRROR:-}"                    # ghproxy-style prefix for release downloads
+# Tried in order after github.com itself when ET_GITHUB_MIRROR is unset. Release
+# assets cannot be served by jsDelivr (its /gh/ endpoint only exposes files
+# committed to the repo, capped at 20MB), so these are ghproxy-style prefixes.
+# Set to empty to disable the fallback entirely.
+ET_GITHUB_MIRRORS="${ET_GITHUB_MIRRORS-https://ghfast.top https://gh-proxy.com}"
 ET_GITHUB_TOKEN="${ET_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"    # PAT to lift the 60/h anonymous rate limit
 ET_SHA256="${ET_SHA256:-}"                                 # expected sha256 of the release zip (optional)
 ET_CACHE_TTL="${ET_CACHE_TTL:-600}"                        # reuse cached release list within N seconds (0=off)
@@ -1110,6 +1116,25 @@ _mirror_url() {
     fi
 }
 
+# Candidate download URLs, one per line, in the order they should be tried.
+# An explicit ET_GITHUB_MIRROR goes first; github.com always stays in the list
+# because api.github.com is required for the digest anyway, so its reachability
+# is already assumed. Falling back through untrusted proxies does not weaken
+# integrity: the expected SHA-256 comes from ET_GITHUB_DIGEST_API, which
+# deliberately ignores every mirror setting, and a tampered zip fails it.
+_download_urls() {
+    local _u="$1" _m
+    if [ -n "$ET_GITHUB_MIRROR" ]; then
+        printf '%s/%s\n' "${ET_GITHUB_MIRROR%/}" "$_u"
+        printf '%s\n' "$_u"
+        return 0
+    fi
+    printf '%s\n' "$_u"
+    for _m in $ET_GITHUB_MIRRORS; do
+        printf '%s/%s\n' "${_m%/}" "$_u"
+    done
+}
+
 # Fetch a GitHub API URL; adds an auth header when a token is set. Prints body, returns curl status.
 _gh_api() {
     if [ -n "$ET_GITHUB_TOKEN" ]; then
@@ -1380,28 +1405,41 @@ do_download() {
 
     local zip_name="easytier-linux-${arch}-${ver}.zip"
     local url="https://github.com/EasyTier/EasyTier/releases/download/${ver}/${zip_name}"
-    local dl_url; dl_url=$(_mirror_url "$url")
     local zip_path="${TMP_DIR}/${zip_name}"
 
     section "$(t "Download EasyTier" "下载 EasyTier")"
     msg_info "$(t "Version: ${ver}  Arch: ${arch}" "版本: ${ver}  架构: ${arch}")"
-    msg_info "URL:  ${dl_url}"
-    [ -n "$ET_GITHUB_MIRROR" ] && msg_info "$(t "(via mirror ${ET_GITHUB_MIRROR})" "(经镜像 ${ET_GITHUB_MIRROR})")"
 
     # /tmp must hold at least the zip (~30MB) + extracted contents (~80MB)
     _check_space "/tmp" "$ET_MIN_TMP_MB" "$(t "/tmp (download + extract)" "/tmp (下载 + 解压)")" || return 1
 
     mkdir -p "$TMP_DIR"
-    if ! curl -fL --progress-bar --retry 3 --retry-delay 3 --connect-timeout 15 \
-            -o "$zip_path" "$dl_url"; then
-        msg_err "$(t "Download failed; check your network or the version number" "下载失败，请检查网络连接或版本号")"
-        [ -n "$ET_GITHUB_MIRROR" ] && msg_info "$(t "The mirror may be down; try without ET_GITHUB_MIRROR or a different one" "镜像可能不可用；可去掉 ET_GITHUB_MIRROR 或换一个")"
-        return 1
-    fi
-
-    # sanity: a mirror/proxy error page is HTML, not a zip — real zips start with the "PK" magic
-    if [ "$(dd if="$zip_path" bs=2 count=1 2>/dev/null)" != "PK" ]; then
-        msg_err "$(t "Downloaded file is not a valid zip (mirror/proxy returned an error page?)" "下载文件不是有效 zip（镜像/代理返回了错误页？）")"
+    # Walk the candidate sources until one yields something that is actually a zip.
+    # --speed-limit/--speed-time abandon a stalled or crawling transfer instead of
+    # waiting out the full timeout, which is the whole point of having fallbacks.
+    local dl_url got=0
+    while IFS= read -r dl_url; do
+        [ -n "$dl_url" ] || continue
+        msg_info "URL:  ${dl_url}"
+        rm -f "$zip_path" 2>/dev/null || true
+        # Retries are per source, so they multiply across the list. Keep them low
+        # and let the next source be the retry — that is what the list is for.
+        if curl -fL --progress-bar --retry 1 --retry-delay 1 --connect-timeout 8 \
+                --speed-limit 10240 --speed-time 20 -o "$zip_path" "$dl_url"; then
+            # a proxy error page is HTML, not a zip — real zips start with "PK"
+            if [ "$(dd if="$zip_path" bs=2 count=1 2>/dev/null)" = "PK" ]; then
+                got=1
+                break
+            fi
+            msg_warn "$(t "That source returned a non-zip (error page?)" "该源返回的不是 zip（错误页？）")"
+        fi
+        msg_warn "$(t "Source unusable, trying the next one" "该源不可用，尝试下一个")"
+    done <<EOF
+$(_download_urls "$url")
+EOF
+    if [ "$got" -ne 1 ]; then
+        msg_err "$(t "Download failed from every source; check your network or the version number" "所有下载源均失败，请检查网络连接或版本号")"
+        msg_info "$(t "Set ET_GITHUB_MIRROR=<prefix> for a specific proxy, or https_proxy for a normal proxy" "可用 ET_GITHUB_MIRROR=<前缀> 指定代理，或设置 https_proxy 走普通代理")"
         return 1
     fi
 

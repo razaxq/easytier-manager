@@ -88,7 +88,7 @@ sudo env \
 按需追加到上面任意一段里 —— 下载镜像、锁定版本、允许本节点作为出口节点：
 
 ```sh
-  ET_GITHUB_MIRROR=https://ghproxy.com \
+  ET_GITHUB_MIRROR=https://ghfast.top \
   ET_VERSION=v2.6.4 \
   ET_ENABLE_EXIT_NODE=1 \
 ```
@@ -121,7 +121,8 @@ sudo env \
 | `ET_ALLOW_VERSION_FALLBACK` / `ET_DEFAULT_VERSION` | API 失败且未安装时允许回退到指定版本 | `0` / `v2.6.4` |
 | `ET_SHA256` | 手动指定 zip 的 SHA-256；未设置时自动读官方 digest | 自动 |
 | `ET_ALLOW_UNVERIFIED` | `1` = 无法取得/计算 SHA-256 时仍继续（不推荐） | `0` |
-| `ET_GITHUB_MIRROR` | 下载前缀镜像（大陆加速） | 空 |
+| `ET_GITHUB_MIRROR` | 下载前缀镜像（大陆加速），设置后优先使用，github.com 兜底 | 空 |
+| `ET_GITHUB_MIRRORS` | 直连失败后依次尝试的备用前缀，留空则关闭自动回退 | `https://ghfast.top https://gh-proxy.com` |
 | `ET_GITHUB_API` / `ET_GITHUB_TOKEN` | API 基址 / PAT（解除 60 次每小时限流） | 官方 / 空 |
 | `ET_CACHE_TTL` | 版本列表缓存秒数（`0` 关闭） | `600` |
 | `ET_MIN_TMP_MB` | 下载+解压所需 `/tmp` 最小空间 (MB) | `120` |
