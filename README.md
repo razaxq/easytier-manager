@@ -1,72 +1,45 @@
 # EasyTier Manager
 
 [![ShellCheck](https://github.com/razaxq/easytier-manager/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/razaxq/easytier-manager/actions/workflows/shellcheck.yml)
+[![Upstream compatibility](https://github.com/razaxq/easytier-manager/actions/workflows/upstream-compat.yml/badge.svg)](https://github.com/razaxq/easytier-manager/actions/workflows/upstream-compat.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![POSIX sh](https://img.shields.io/badge/shell-POSIX%20sh-blue.svg)](#)
 
-一个用于在 Linux 发行版上**安装、配置与管理 [EasyTier](https://github.com/EasyTier/EasyTier)** 的交互式脚本。纯 POSIX `sh`，无需 Bash、Python 或其他运行时依赖。
+在 Linux 上**安装、配置与管理 [EasyTier](https://github.com/EasyTier/EasyTier)** 的交互式脚本。纯 POSIX `sh`，无 Bash / Python 依赖。
 
-> EasyTier 本身是由 [EasyTier/EasyTier](https://github.com/EasyTier/EasyTier) 维护的开源 P2P 异地组网工具。本仓库仅提供第三方安装脚本，与上游项目无隶属关系。
+> 第三方脚本，与上游项目无隶属关系。EasyTier 二进制的版权归其作者所有。
 
----
-
-## 🌐 语言 / Language
-
-只有 `easytier.sh` 一个脚本，**内置中英双语**。语言选择顺序为：`ET_LANG` 环境变量 > 系统 locale 自动识别（`zh*` → 中文）> 默认英文。
-
-在中文环境（`zh_CN` 等）下会自动显示中文；在英文 / `C` locale 的主机上想用中文，设 `ET_LANG=zh` 即可：
-
-```sh
-ET_LANG=zh sh easytier.sh    # 强制中文
-ET_LANG=en sh easytier.sh    # 强制英文
-```
-
-> **`easytier.sh` is a single bilingual script.** It auto-detects the language from your locale (`zh*` → Chinese, otherwise English) and honors `ET_LANG=en|zh`. On an English- or `C`-locale host, set `ET_LANG=zh` to force Chinese.
+**语言**：单脚本内置中英双语，按 `ET_LANG` > 系统 locale（`zh*` → 中文）> 英文 的顺序选择。
+*Single bilingual script; auto-detects from locale, honors `ET_LANG=en|zh`.*
 
 ---
 
 ## ✨ 功能
 
-- 🎛  **交互式菜单** —— 安装 / 更新 / 配置 / 重启 / 卸载 / 查看状态，一站式完成
-- 🧩  **TOML 或 Web 控制台** 两种配置模式，含配置向导
-- 🐧  **多发行版 / 多架构** —— OpenWrt、Debian、Ubuntu、RHEL、Alpine、Arch；x86_64 / aarch64 / armv7 / riscv64
-- ⚙️  **多 init 系统** —— procd（OpenWrt）/ systemd / OpenRC，服务文件自动生成
-- 🔒  **输入校验** —— CIDR、URL、端口格式检查，密钥强度检测
-- 🤖  **非交互模式 + 子命令** —— 环境变量预设全部参数（Ansible / CI）；`status`/`start`/`stop`/`restart` 一次性子命令便于 cron
-- 🌏  **下载加速与校验** —— 支持 `ET_GITHUB_MIRROR` 前缀镜像 / `https_proxy` 代理 / `ET_GITHUB_TOKEN` 解除 API 限流；版本列表缓存；下载做 zip 魔数与可选 `ET_SHA256` 完整性校验
-- 📡  **网络概览** —— 状态页调用 `easytier-cli` 展示已连接节点与路由
-- 🛡  **服务加固** —— systemd 单元默认启用 `NoNewPrivileges`/`ProtectSystem` 等沙箱项（保证 TUN/转发不受影响）
-- 📦  **版本备份** —— 更新时可选保留旧二进制（默认不保留；保留时按数量自动轮换，配置备份同步轮转）
-- 📋  **日志管理** —— 脚本操作日志写入 `/var/log/easytier-manager.log`；自动配置 core 文件日志大小与轮转，避免日志填满磁盘
-- 🪪  **升级身份兼容** —— Web 模式升级或重配时保留机器 ID，避免控制台把原节点误识别为新设备并隐藏原网络配置
-- 🪶  **小闪存友好** —— 仅安装必需二进制（默认跳过 `easytier-web` GUI 与未启用的 `easytier-web-embed`）；procd 下日志/备份默认值自动收紧；下载与安装前进行磁盘空间预检
+- **交互式菜单** —— 安装 / 更新 / 配置 / 重启 / 卸载 / 状态一站式完成
+- **两种配置模式** —— TOML 配置文件或 Web 控制台下发，均含向导
+- **广覆盖** —— OpenWrt(procd) / Debian / Ubuntu / RHEL / Arch(systemd) / Alpine(OpenRC)；x86_64、ARM soft/hard-float、RISC-V、LoongArch、MIPS
+- **非交互模式 + 子命令** —— 环境变量预设全部参数（Ansible / CI）；`status`/`start`/`stop`/`restart` 便于 cron，失败返回非零退出码
+- **强制完整性校验** —— 默认从官方 Release API 取 SHA-256 强制比对；支持镜像 / 代理 / PAT 加速，但镜像不被信任为摘要来源
+- **安全默认值** —— Web 管理界面仅监听 `127.0.0.1`，core 控制端口绑定回环，出口节点等敏感能力默认关闭；systemd 单元启用 `NoNewPrivileges`/`ProtectSystem` 等沙箱项
+- **稳健的安装事务** —— 先下载校验、暂存并验证版本，再停服务整体提交，失败可回滚；`Ctrl+C` 不会留下半装的二进制或截断的配置
+- **升级身份兼容** —— Web 模式升级/重配保留机器 ID，避免控制台把原节点误识别为新设备
+- **小闪存友好** —— 只装必需二进制；procd 下日志/备份默认值自动收紧；安装前做空间预检
 
 ---
 
 ## 🚀 快速开始
 
-### 交互式安装（推荐）
-
 ```sh
 curl -fsSL https://raw.githubusercontent.com/razaxq/easytier-manager/main/easytier.sh -o easytier.sh
-sudo sh easytier.sh
+sudo sh easytier.sh              # 交互式；加 ET_LANG=zh 可强制中文
 ```
 
-中文环境会自动显示中文；英文 / `C` locale 主机可加 `ET_LANG=zh` 强制中文：
+非交互式：
 
 ```sh
-sudo ET_LANG=zh sh easytier.sh
-```
-
-> 🔔 脚本需要 `curl` 和 `unzip`。若缺失，脚本会提示对应的安装命令。
-> 💡 随时可按 `Ctrl+C` **安全退出**：安装/写配置等关键步骤会先完成或整体丢弃当前未提交的改动，绝不留下半装的二进制或被截断的配置。
-
-### 非交互式安装
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/razaxq/easytier-manager/main/easytier.sh -o easytier.sh
 sudo ET_NONINTERACTIVE=1 \
-     ET_VERSION=v2.4.5 \
+     ET_VERSION=v2.6.4 \
      ET_MODE=toml \
      ET_INSTANCE_NAME=mynode \
      ET_VIRTUAL_IP=10.0.0.1/24 \
@@ -75,99 +48,76 @@ sudo ET_NONINTERACTIVE=1 \
      sh easytier.sh
 ```
 
----
+> 需要 `curl` 与 `unzip`；缺失时脚本会提示对应安装命令。
 
-## 🧰 支持的系统
-
-| 发行版族 | init 系统 | 备注 |
-|---|---|---|
-| OpenWrt | procd | `/etc/init.d/` |
-| Debian / Ubuntu / Raspbian | systemd | |
-| RHEL / Fedora / Rocky / AlmaLinux | systemd | |
-| Arch / Manjaro | systemd | |
-| Alpine | OpenRC | |
-
-**支持架构**：`x86_64` · `aarch64` · `armv7` · `riscv64`
-
----
-
-## 📖 使用
-
-### 主菜单
-
-```
-  ──────────────────────────────────────────
-    EasyTier 管理脚本  vX.Y.Z
-  ──────────────────────────────────────────
-  系统  debian        架构  x86_64
-  Init  systemd
-  版本  2.4.5
-  配置  TOML 配置文件
-  ──────────────────────────────────────────
-
-  ── 日常 ──
-  1)  查看服务状态
-  2)  重启服务
-  3)  停止服务
-  ── 配置 ──
-  4)  修改配置（TOML / Web 模式向导）
-  5)  Web 控制台管理
-  ── 安装维护 ──
-  6)  更新 / 重装（选择版本）
-  7)  文件位置与日志
-  8)  卸载 EasyTier
-
-  0)  退出
-```
-
-### 命令行子命令（便于脚本 / cron）
-
-除交互式菜单外，脚本还支持一次性子命令，执行后即退出：
+子命令（执行后即退出，无参数则进入菜单）：
 
 ```sh
 sh easytier.sh status     # 服务状态 + 网络概览（easytier-cli peer/route）
-sh easytier.sh start      # 启动 easytier-core（及已配置的 web-embed）
-sh easytier.sh stop       # 停止
-sh easytier.sh restart    # 重启
+sh easytier.sh start      # 启动 / stop 停止 / restart 重启
 sh easytier.sh version    # 打印脚本与 core 版本
 sh easytier.sh help       # 帮助
 ```
 
-无参数（或 `menu`）进入交互式菜单。
+---
 
-### 非交互环境变量
+## ⚙️ 环境变量
+
+**基础配置**
 
 | 变量 | 说明 | 示例 |
 |---|---|---|
-| `ET_LANG` | 强制界面语言（覆盖 locale 自动识别） | `en` 或 `zh` |
+| `ET_LANG` | 强制界面语言 | `en` / `zh` |
 | `ET_NONINTERACTIVE` | 启用非交互模式 | `1` |
-| `ET_VERSION` | 安装版本 | `v2.4.5` |
-| `ET_MODE` | 配置模式 | `toml` 或 `web` |
+| `ET_MODE` | 配置模式 | `toml` / `web` |
 | `ET_INSTANCE_NAME` | 节点实例名 | `node-sg-01` |
-| `ET_VIRTUAL_IP` | 虚拟 IPv4（含掩码；`ET_DHCP=1` 时可省略） | `10.0.0.1/24` |
-| `ET_DHCP` | `1` 时用 DHCP 自动分配虚拟 IP（跳过 `ET_VIRTUAL_IP`） | `0`（默认） |
-| `ET_LISTEN_PORT` | 监听基准端口（ws/wss 用 +1/+2） | `11010`（默认） |
+| `ET_VIRTUAL_IP` | 虚拟 IPv4 含掩码（`ET_DHCP=1` 时可省略） | `10.0.0.1/24` |
+| `ET_DHCP` | `1` = DHCP 自动分配虚拟 IP | `0`（默认） |
+| `ET_LISTEN_PORT` | 监听基准端口，范围 1-65533（ws/wss 用 +1/+2） | `11010`（默认） |
 | `ET_DEV_NAME` | TUN 设备名 | `easytier0`（默认） |
-| `ET_NETWORK_NAME` | 虚拟网络名 | `mynet` |
-| `ET_NETWORK_SECRET` | 网络密钥（留空自动生成） | `abc...` |
+| `ET_NETWORK_NAME` / `ET_NETWORK_SECRET` | 虚拟网络名 / 密钥（留空自动生成） | `mynet` |
 | `ET_PEERS` | 逗号分隔 Peer 列表 | `tcp://a:11010,udp://b:11010` |
-| `ET_PROXY_CIDR` | 子网代理 CIDR（可多个，逗号分隔） | `192.168.1.0/24,10.9.0.0/24` |
+| `ET_PROXY_CIDR` | 子网代理 CIDR，可多个 | `192.168.1.0/24,10.9.0.0/24` |
 | `ET_WEB_URL` | Web 模式接入 URL | `udp://host:22020/user` |
-| `ET_MACHINE_ID` | 固定 Web 控制台机器 ID；通常无需设置，脚本会自动迁移/保留（可用 UUID 或不含空白且不以 `-` 开头的稳定字符串） | `cad9ff67-...` |
-| `ET_BACKUP_KEEP` | 每个二进制 / 配置保留的备份份数（非交互下 `0` = 不备份） | `3`（默认；procd 下 `1`） |
-| `ET_RELEASES_COUNT` | 版本列表最多条数 | `20`（默认） |
-| `ET_INSTALL_WEB_GUI` | `1` 时安装 `easytier-web` GUI 客户端 | `0`（默认不装） |
-| `ET_GITHUB_MIRROR` | github.com 下载前缀镜像（大陆加速） | `https://ghproxy.com` |
-| `ET_GITHUB_API` | GitHub API 基址（用 API 镜像时覆盖） | `https://api.github.com`（默认） |
-| `ET_GITHUB_TOKEN` | GitHub PAT，解除 60 次/时匿名 API 限流（或用 `GITHUB_TOKEN`） | `ghp_...` |
-| `ET_SHA256` | 期望的发布 zip 的 sha256（完整性校验） | `<hex>` |
-| `ET_CACHE_TTL` | 版本列表缓存秒数（`0` 关闭） | `600`（默认） |
-| `ET_MIN_TMP_MB` | 下载+解压所需 `/tmp` 最小可用空间 (MB) | `120`（默认） |
-| `ET_FILE_LOG_DIR` | core 文件日志目录 | `/var/log/easytier`（默认） |
-| `ET_FILE_LOG_LEVEL` | core 文件日志级别 | `error`（默认；可选 `off`/`error`/`warn`/`info`/`debug`/`trace`） |
-| `ET_FILE_LOG_SIZE` | 每份日志大小 (MB) | `10`（默认；procd 下 `2`） |
-| `ET_FILE_LOG_COUNT` | 最多保留日志份数 | `5`（默认；procd 下 `3`） |
-| `LOG_FILE` | 脚本日志文件路径 | `/var/log/easytier-manager.log` |
+| `ET_MACHINE_ID` | 固定机器 ID；通常无需设置，脚本会自动迁移/保留 | `cad9ff67-...` |
+
+**版本与下载**
+
+| 变量 | 说明 | 默认 |
+|---|---|---|
+| `ET_VERSION` | 安装版本；显式设置时可指定旧版或预发布版 | 最新稳定版 |
+| `ET_ARCH` | 覆盖自动探测的架构：`x86_64` `aarch64` `arm` `armhf` `armv7` `armv7hf` `riscv64` `loongarch64` `mips` `mipsel` | 自动探测 |
+| `ET_ALLOW_PRERELEASE` | `1` = 允许自动选中预发布版 | `0` |
+| `ET_ALLOW_VERSION_FALLBACK` / `ET_DEFAULT_VERSION` | API 失败且未安装时允许回退到指定版本 | `0` / `v2.6.4` |
+| `ET_SHA256` | 手动指定 zip 的 SHA-256；未设置时自动读官方 digest | 自动 |
+| `ET_ALLOW_UNVERIFIED` | `1` = 无法取得/计算 SHA-256 时仍继续（不推荐） | `0` |
+| `ET_GITHUB_MIRROR` | 下载前缀镜像（大陆加速） | 空 |
+| `ET_GITHUB_API` / `ET_GITHUB_TOKEN` | API 基址 / PAT（解除 60 次每小时限流） | 官方 / 空 |
+| `ET_CACHE_TTL` | 版本列表缓存秒数（`0` 关闭） | `600` |
+| `ET_MIN_TMP_MB` | 下载+解压所需 `/tmp` 最小空间 (MB) | `120` |
+
+**网络与安全**
+
+| 变量 | 说明 | 默认 |
+|---|---|---|
+| `ET_WEB_BIND_ADDR` | Web 管理界面监听地址；对外暴露需显式设为 `0.0.0.0` | `127.0.0.1` |
+| `ET_WEB_DB_PATH` | Web 控制台数据库路径 | `/var/lib/easytier-web/et.db` |
+| `ET_RPC_PORTAL` | core 本机控制端口（`easytier-cli` 连接目标），留空用上游默认 | `127.0.0.1:15888` |
+| `ET_ENABLE_EXIT_NODE` | `1` = 允许本节点充当出口节点 | `0` |
+| `ET_PRIVATE_MODE` | `1` = 拒绝陌生网络 | `1` |
+| `ET_USE_SMOLTCP` | `1` = TCP 代理启用 smoltcp | `0` |
+| `ET_DATA_COMPRESS_ALGO` | 压缩算法 `0`/`1`/`2` | `0`（不压缩） |
+
+**日志与维护**
+
+| 变量 | 说明 | 默认 |
+|---|---|---|
+| `ET_FILE_LOG_DIR` / `ET_FILE_LOG_LEVEL` | core 日志目录 / 级别（`off`…`trace`） | `/var/log/easytier` / `error` |
+| `ET_FILE_LOG_SIZE` / `ET_FILE_LOG_COUNT` | 每份大小 (MB) / 保留份数 | `10` / `5`（procd 下 `2` / `3`） |
+| `ET_BACKUP_KEEP` | 每个二进制/配置保留的备份份数（`0` = 不备份） | `3`（procd 下 `1`） |
+| `ET_RELEASES_COUNT` | 版本列表最多条数 | `20` |
+| `ET_INSTALL_WEB_GUI` | `1` = 安装 `easytier-web` GUI 客户端 | `0` |
+| `LOG_FILE` | 脚本自身日志路径 | `/var/log/easytier-manager.log` |
 
 ---
 
@@ -176,57 +126,52 @@ sh easytier.sh help       # 帮助
 | 路径 | 说明 |
 |---|---|
 | `/usr/bin/easytier-core` `easytier-cli` | 节点必备二进制（始终安装） |
-| `/usr/bin/easytier-web-embed` | Web 控制台守护进程（仅 Web 自建模式按需安装） |
-| `/usr/bin/easytier-web` | 独立 GUI 客户端（仅 `ET_INSTALL_WEB_GUI=1` 时安装） |
-| `/usr/bin/easytier-*.bak.<ts>` | 旧版本备份（询问保留；轮换数 = `ET_BACKUP_KEEP`） |
+| `/usr/bin/easytier-web-embed` | Web 控制台守护进程（自建模式按需安装） |
+| `/usr/bin/easytier-web` | 独立 GUI 客户端（仅 `ET_INSTALL_WEB_GUI=1`） |
+| `/usr/bin/easytier-*.bak.<ts>` | 旧版本备份（按 `ET_BACKUP_KEEP` 轮换） |
 | `/etc/easytier/config.toml` | TOML 模式配置 |
-| `/etc/easytier/core.args` | core 启动参数 |
-| `/etc/easytier/web.args` | web-embed 启动参数 |
-| `/var/lib/easytier/machine_id` | EasyTier 持久化机器 ID（systemd 默认；若服务保留 `HOME`/`XDG_DATA_HOME`，则位于对应数据目录） |
-| `/etc/systemd/system/easytier.service` 等 | 服务单元（按 init 系统） |
+| `/etc/easytier/core.args` · `web.args` | core / web-embed 启动参数 |
+| `/var/lib/easytier/machine_id` | 持久化机器 ID（若服务保留 `HOME`/`XDG_DATA_HOME` 则在对应数据目录） |
+| `/var/lib/easytier-web/et.db` | Web 控制台账号与网络配置 |
+| `/var/log/easytier/` | core 文件日志（按大小轮转，OpenWrt 上落在 tmpfs） |
 | `/var/log/easytier-manager.log` | 脚本自身日志 |
-| `/var/log/easytier/` | easytier-core 文件日志（按大小轮转，OpenWrt 上落在 tmpfs） |
 
 ---
 
-## 🧪 开发与贡献
+## 🧪 开发
 
-欢迎提 Issue 和 PR！
-
-本地检查：
+欢迎提 Issue 和 PR。本地检查：
 
 ```sh
 shellcheck -s sh easytier.sh
 sh tests/test_machine_id.sh
+sh tests/test_manager.sh
+sh tests/test_upstream_compat.sh   # 需联网，会下载最新稳定版
 ```
 
-CI 会在每次 push / PR 时对所有 `*.sh` 跑 ShellCheck（见 [`.github/workflows/shellcheck.yml`](.github/workflows/shellcheck.yml)）。
+CI 跑 ShellCheck 与单元测试；另有每周任务核验上游官方摘要、Release 结构、CLI 参数与生成的 TOML。
 
-> ⚠️ 中英文案都内联在 `easytier.sh` 的 `t "en" "zh"` 调用里，改文案时**两种语言一起改**。
+> ⚠️ 中英文案内联在 `t "en" "zh"` 调用里，改文案时**两种语言一起改**。
 
 ---
 
 ## ❓ 常见问题
 
 **Q: 为什么是 `/bin/sh` 而不是 Bash？**
-A: 兼容 OpenWrt（BusyBox ash）和 Alpine（默认无 Bash），让脚本在路由器上也能跑。
+兼容 OpenWrt（BusyBox ash）和 Alpine（默认无 Bash），让脚本在路由器上也能跑。
 
-**Q: 下载失败怎么办？**
-A: 检查网络。大陆用户可设置 `ET_GITHUB_MIRROR=https://ghproxy.com` 走前缀镜像，或设置 `https_proxy` 走代理；若 API 被限流（60 次/时），设置 `ET_GITHUB_TOKEN=<PAT>`。脚本会自动缓存版本列表（`ET_CACHE_TTL` 秒）以减少 API 调用，并对下载文件做 zip 魔数/可选 `ET_SHA256` 完整性校验。
+**Q: 下载或 SHA-256 查询失败？**
+大陆用户可用 `ET_GITHUB_MIRROR` 走下载镜像或设 `https_proxy`；API 限流时设 `ET_GITHUB_TOKEN`。镜像不被信任为摘要来源，脚本仍从官方 GitHub API 取 SHA-256；也可手动设置官方 `ET_SHA256`。仅在明确接受风险时使用 `ET_ALLOW_UNVERIFIED=1`。
 
-**Q: 卸载后还想保留配置？**
-A: 卸载流程会**分步**询问是否删除备份和 `/etc/easytier`，默认保留。
+**Q: 为什么 Web 控制台只能本机访问？**
+上游初始化数据库时预置了 `admin/admin`（超级用户）与 `user/user` 两个账号，注册新账号并不会移除它们。建议通过 SSH 转发或带 TLS/访问控制的反向隧道访问；确需局域网监听时设 `ET_WEB_BIND_ADDR=0.0.0.0`，并立即改掉这两个账号的密码。
 
-**Q: 如何升级到新版？**
-A: 主菜单选 `6) 更新 / 重装`，脚本会拉取最新 Release 列表。「仅更新二进制」保留现有配置。
+**Q: 卸载会删掉配置和节点身份吗？**
+不会自动删。卸载流程**分步**询问是否删除备份、`/etc/easytier`、机器身份和 Web 数据库，默认全部保留。
 
-**Q: 为什么升级后 Web 控制台中的原网络配置不见了？**
-A: Web 控制台按机器 ID 关联节点和配置。旧版 EasyTier 到新版的默认 ID 算法曾发生兼容迁移；脚本从 v2.6.1 起会在替换二进制前触发旧 ID 迁移，并在重配时保留 `--machine-id`。若节点已发生过 ID 变化，需要先从控制台或备份找回旧 ID，再以 `ET_MACHINE_ID=<旧ID> sh easytier.sh` 重配一次。
+**Q: 升级后 Web 控制台里原网络配置不见了？**
+控制台按机器 ID 关联节点。旧版到新版的默认 ID 算法曾发生迁移；脚本自 v2.6.1 起会在替换二进制前触发旧 ID 迁移，并在重配时保留 `--machine-id`。若 ID 已变化，需先找回旧 ID 再执行 `ET_MACHINE_ID=<旧ID> sh easytier.sh` 重配一次。
 
 ---
 
-## 📄 License
-
 [MIT](LICENSE) © 2026 Ramos
-
-本脚本与 [EasyTier 上游项目](https://github.com/EasyTier/EasyTier) 无隶属关系。EasyTier 二进制的版权归其作者所有。
