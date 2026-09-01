@@ -1,4 +1,6 @@
 #!/bin/sh
+# shellcheck disable=SC2034  # these globals drive the sourced easytier.sh; ShellCheck
+#                              cannot see reads that happen across the source boundary
 set -eu
 
 TEST_DIR=$(mktemp -d "${TMPDIR:-/tmp}/easytier-manager-core-test.XXXXXX")
