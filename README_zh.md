@@ -140,7 +140,7 @@ sudo env \
 
 | 变量 | 说明 | 默认 |
 |---|---|---|
-| `ET_FILE_LOG_DIR` / `ET_FILE_LOG_LEVEL` | core 日志目录 / 级别（`off`…`trace`） | `/var/log/easytier` / `error` |
+| `ET_FILE_LOG_DIR` / `ET_FILE_LOG_LEVEL` | core 日志目录 / 级别（`off`…`trace`）。卸载时会询问是否 `rm -rf` 此目录，因此必须是至少两级的路径且不能是系统目录 | `/var/log/easytier` / `error` |
 | `ET_FILE_LOG_SIZE` / `ET_FILE_LOG_COUNT` | 每份大小 (MB) / 保留份数 | `10` / `5`（procd 下 `2` / `3`） |
 | `ET_BACKUP_KEEP` | 每个二进制/配置保留的备份份数（`0` = 不备份） | `3`（procd 下 `1`） |
 | `ET_RELEASES_COUNT` | 版本列表最多条数 | `20` |

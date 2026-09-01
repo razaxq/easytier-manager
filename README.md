@@ -140,7 +140,7 @@ Optional additions to either block — a download mirror, a pinned version, and 
 
 | Variable | Description | Default |
 |---|---|---|
-| `ET_FILE_LOG_DIR` / `ET_FILE_LOG_LEVEL` | Core log directory / level (`off`…`trace`) | `/var/log/easytier` / `error` |
+| `ET_FILE_LOG_DIR` / `ET_FILE_LOG_LEVEL` | Core log directory / level (`off`…`trace`). Uninstall offers to `rm -rf` this directory, so it must be at least two levels deep and not a system directory | `/var/log/easytier` / `error` |
 | `ET_FILE_LOG_SIZE` / `ET_FILE_LOG_COUNT` | Size per file (MB) / files kept | `10` / `5` (procd: `2` / `3`) |
 | `ET_BACKUP_KEEP` | Backups kept per binary/config (`0` = no backup) | `3` (procd: `1`) |
 | `ET_RELEASES_COUNT` | Maximum entries in the release list | `20` |

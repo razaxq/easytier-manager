@@ -149,6 +149,55 @@ set -e
 [ ! -e "$ET_CORE_ARGS_FILE" ] || fail 'failed atomic commit created the target file'
 pass 'atomic write failures propagate to callers'
 
+# Values reaching core.args / web.args are re-read by the service files: OpenRC
+# interpolates them in a double-quoted shell assignment, systemd expands $VAR.
+is_safe_arg_value 'http://127.0.0.1:11211' || fail 'a plain URL was rejected'
+is_safe_arg_value 'udp://h:22020/my%20user' || fail 'a percent-encoded URL was rejected'
+! is_safe_arg_value 'http://$(id -u).example.com' || fail 'command substitution was accepted'
+! is_safe_arg_value 'http://`id`.example.com' || fail 'a backquote was accepted'
+! is_safe_arg_value 'http://a b.example.com' || fail 'an embedded space was accepted'
+! is_safe_arg_value 'http://x".example.com' || fail 'a double quote was accepted'
+pass 'shell metacharacters cannot reach a generated service file'
+
+is_valid_http_url 'https://console.example.com' || fail 'a valid api-host was rejected'
+! is_valid_http_url 'udp://console.example.com' || fail 'a non-http api-host was accepted'
+! is_valid_http_url 'http://$(reboot).example.com' || fail 'an injected api-host was accepted'
+pass 'api-host is validated as an http(s) URL'
+
+# systemd reads '%' in ExecStart as a specifier; a literal one has to be doubled.
+assert_eq 'a%%20b' "$(_systemd_escape_args 'a%20b')" 'percent signs are escaped for systemd'
+
+# uninstall runs `rm -rf` on the log directory, so system paths must be refused
+is_safe_data_path /var/log/easytier || fail 'the default log directory was rejected'
+is_safe_data_path /var/lib/easytier-web/et.db || fail 'the default database path was rejected'
+for unsafe in / /var /etc /var/log /usr/local /var/log/ /var/log/../.. ; do
+    ! is_safe_data_path "$unsafe" || fail "unsafe data path accepted: $unsafe"
+done
+pass 'system directories are refused as data paths'
+
+# `\|` alternation is a GNU extension; musl treats it as a literal pipe
+ET_CORE_SERVICE_FILE="$TEST_DIR/easytier.service"
+printf 'ExecStart=/usr/bin/easytier-core -w udp://h/u --machine-id "abc-123"\n' \
+    > "$ET_CORE_SERVICE_FILE"
+assert_eq 'abc-123' "$(_machine_id_from_service)" \
+    'quotes around a service-file machine ID are stripped portably'
+
+ET_CORE_CONFIG_FILE="$TEST_DIR/config.toml"
+printf 'dev_name = "tun-custom"\n' > "$ET_CORE_CONFIG_FILE"
+assert_eq tun-custom "$(_tun_dev_name)" 'uninstall targets the configured TUN device'
+rm -f "$ET_CORE_CONFIG_FILE"
+assert_eq easytier0 "$(_tun_dev_name)" 'TUN device falls back to the default'
+
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) pass 'staging file mode is checked on the CI runner' ;;
+    *)
+        _new_private_tmp "$TEST_DIR/private.tmp" || fail 'private staging file was not created'
+        printf 'secret\n' > "$TEST_DIR/private.tmp"
+        assert_eq 600 "$(stat -c %a "$TEST_DIR/private.tmp")" \
+            'staging files are 0600 before anything is written to them'
+        ;;
+esac
+
 detect_system() { OS_TYPE=debian; INIT_SYS=systemd; ARCH_NAME=x86_64; }
 _svc_start() { return 1; }
 check_proc() { return 1; }

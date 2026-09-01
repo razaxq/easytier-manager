@@ -67,7 +67,7 @@
 #     are auto-tightened by main() (values you set explicitly still win)
 # ==============================================================================
 
-SCRIPT_VERSION="2.7.0"
+SCRIPT_VERSION="2.7.1"
 
 # ── Tunables ──────────────────────────────────────────
 # These sentinels record whether the user set the vars explicitly; after detect_system, on procd we
@@ -288,6 +288,16 @@ crit_end() {
     return 0
 }
 
+# Create the staging file with 0600 *before* anything is written into it. A plain
+# `> "$tmp"` would create it 0644 under the default umask, leaving the network
+# secret / join URL world-readable until _commit_tmp chmods it — a window that
+# _validate_core_config widens to the runtime of an external binary.
+_new_private_tmp() {
+    rm -f "$1" 2>/dev/null || true
+    ( umask 077; : > "$1" ) || return 1
+    return 0
+}
+
 # Atomic commit: set perms → checkpoint (interruptible/discardable) → atomic same-fs rename onto target
 # Usage: _commit_tmp <tmp> <target> [chmod mode]
 _commit_tmp() {
@@ -414,19 +424,34 @@ _detect_arch() {
 # avoiding the 15-char process-name truncation); if pgrep is missing, fall back to scanning /proc (BusyBox/OpenWrt
 # slim firmware often lacks pgrep, and all targets are Linux where /proc always exists, so the fallback is reliable).
 _pids_of() {
+    # The match must end at an argument boundary: a bare "easytier-web" pattern
+    # would otherwise also match the running easytier-web-embed process.
     if command -v pgrep > /dev/null 2>&1; then
-        pgrep -f "/usr/bin/${1}" 2>/dev/null
+        pgrep -f "/usr/bin/${1}( |\$)" 2>/dev/null
         return
     fi
     local p cmd
     for p in /proc/[0-9]*; do
         [ -r "$p/cmdline" ] || continue
+        # every argument is terminated by the separator, so a trailing space is guaranteed
         cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)
-        case "$cmd" in *"/usr/bin/${1}"*) printf '%s\n' "${p##*/}" ;; esac
+        case "$cmd" in *"/usr/bin/${1} "*) printf '%s\n' "${p##*/}" ;; esac
     done
 }
 _proc_running() { [ -n "$(_pids_of "$1")" ]; }
 _proc_pid()     { _pids_of "$1" | head -1; }
+
+# The TUN device actually in use. dev_name is configurable, so uninstall must not
+# assume the easytier0 default or it leaves a stale interface behind.
+_tun_dev_name() {
+    local _name=""
+    if [ -f "$ET_CORE_CONFIG_FILE" ]; then
+        _name=$(sed -n 's/^[[:space:]]*dev_name[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+                "$ET_CORE_CONFIG_FILE" 2>/dev/null | head -1)
+    fi
+    [ -n "$_name" ] || _name="${ET_DEV_NAME:-easytier0}"
+    printf '%s' "$_name"
+}
 
 # Kill all processes of the given binary (replaces killall, avoiding its 15-char name truncation & absence)
 _kill_bin() {
@@ -522,7 +547,56 @@ is_valid_cidr() {
 }
 
 is_valid_url() {
-    printf '%s' "$1" | grep -qE '^(tcp|udp|ws|wss)://[^[:space:]"]+$'
+    printf '%s' "$1" | grep -qE '^(tcp|udp|ws|wss)://[^[:space:]"]+$' && is_safe_arg_value "$1"
+}
+
+# --api-host is frontend metadata but still lands in a service file, so it gets the
+# same treatment as every other URL the script accepts.
+is_valid_http_url() {
+    printf '%s' "$1" | grep -qE '^https?://[^[:space:]"]+$' && is_safe_arg_value "$1"
+}
+
+# Anything written into core.args / web.args is re-read by the service files: the
+# OpenRC init script interpolates command_args inside a double-quoted shell
+# assignment, and systemd expands $VAR in ExecStart. Reject shell metacharacters
+# before such a value can reach either file. ('%' is legal here — it is escaped
+# for systemd by _systemd_escape_args instead, so percent-encoded URLs still work.)
+is_safe_arg_value() {
+    case "${1:-}" in
+        '') return 1 ;;
+        *[[:space:]]*|*'$'*|*'`'*|*'\'*|*'"'*|*"'"*) return 1 ;;
+    esac
+    return 0
+}
+
+# systemd reads '%' in ExecStart as the start of a specifier; a literal one is '%%'.
+_systemd_escape_args() {
+    printf '%s' "$1" | sed 's/%/%%/g'
+}
+
+# A path the script may create, write into and offer to delete. Refuse system
+# directories outright: uninstall runs `rm -rf` on ET_FILE_LOG_DIR, so a value
+# like /var/log would take the whole directory with it.
+is_safe_data_path() {
+    local _d="${1:-}"
+    case "$_d" in
+        /*) ;;
+        *) return 1 ;;
+    esac
+    is_safe_arg_value "$_d" || return 1
+    case "$_d" in
+        */) return 1 ;;                       # a trailing slash hides an empty last component
+        *//*|*/./*|*/../*|*/..) return 1 ;;   # no traversal or empty components
+    esac
+    # must be at least two levels deep, so "/var" or "/etc" can never be the target
+    case "${_d#/}" in
+        */*) ;;
+        *) return 1 ;;
+    esac
+    case "$_d" in
+        /var/log|/var/lib|/var/tmp|/usr/bin|/usr/lib|/usr/local|/etc/easytier) return 1 ;;
+    esac
+    return 0
 }
 
 is_valid_web_bind_addr() {
@@ -584,6 +658,11 @@ _validate_tunables() {
     case "$ET_FILE_LOG_LEVEL" in off|error|warn|info|debug|trace) ;;
         *) msg_err "$(t "Invalid ET_FILE_LOG_LEVEL: $ET_FILE_LOG_LEVEL" "ET_FILE_LOG_LEVEL 无效: $ET_FILE_LOG_LEVEL")"; return 1 ;;
     esac
+    # This path is written into the service files and is `rm -rf`'d by uninstall.
+    is_safe_data_path "$ET_FILE_LOG_DIR" || {
+        msg_err "$(t "Unsafe ET_FILE_LOG_DIR: $ET_FILE_LOG_DIR (needs an absolute path at least two levels deep, no system directory)" "ET_FILE_LOG_DIR 不安全: $ET_FILE_LOG_DIR（须为至少两级的绝对路径，且不能是系统目录）")"; return 1; }
+    is_safe_data_path "$ET_WEB_DB_PATH" || {
+        msg_err "$(t "Unsafe ET_WEB_DB_PATH: $ET_WEB_DB_PATH" "ET_WEB_DB_PATH 不安全: $ET_WEB_DB_PATH")"; return 1; }
     for _name in ET_ALLOW_VERSION_FALLBACK ET_ALLOW_PRERELEASE ET_ALLOW_UNVERIFIED \
                  ET_ENABLE_EXIT_NODE ET_USE_SMOLTCP ET_PRIVATE_MODE; do
         eval "_value=\${${_name}}"
@@ -751,8 +830,9 @@ svc_write_core() {
     [ -f /etc/easytier/core.args ] || { msg_err "$(t "core.args not found" "core.args 不存在")"; return 1; }
 
     # systemd / openrc need the multi-line args merged into a single line
-    local args_line
+    local args_line args_line_systemd
     args_line=$(tr '\n' ' ' < /etc/easytier/core.args | sed 's/[[:space:]]*$//')
+    args_line_systemd=$(_systemd_escape_args "$args_line")
 
     # normalize unknown init to systemd up front, to avoid recursing inside the critical section
     case "$INIT_SYS" in procd|systemd|openrc) ;;
@@ -802,7 +882,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/easytier-core ${args_line}
+ExecStart=/usr/bin/easytier-core ${args_line_systemd}
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535
@@ -852,8 +932,9 @@ EOF
 svc_write_web() {
     [ -f /etc/easytier/web.args ] || { msg_err "$(t "web.args not found" "web.args 不存在")"; return 1; }
 
-    local args_line
+    local args_line args_line_systemd
     args_line=$(tr '\n' ' ' < /etc/easytier/web.args | sed 's/[[:space:]]*$//')
+    args_line_systemd=$(_systemd_escape_args "$args_line")
 
     # Let systemd own the database directory, but only when it actually lives under
     # /var/lib — a custom ET_WEB_DB_PATH is created by setup_web_console instead.
@@ -904,7 +985,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/easytier-web-embed ${args_line}
+ExecStart=/usr/bin/easytier-web-embed ${args_line_systemd}
 ${state_dir_line}
 Restart=on-failure
 RestartSec=5
@@ -1580,7 +1661,9 @@ _machine_id_from_service() {
             }
         }
     ' "$ET_CORE_SERVICE_FILE") || return $?
-    _value=$(printf '%s\n' "$_value" | sed "s/^[\"']\\|[\"']$//g")
+    # Two expressions on purpose: `\|` alternation is a GNU extension that musl's
+    # regcomp (Alpine/OpenWrt) treats as a literal '|', leaving the quotes in place.
+    _value=$(printf '%s\n' "$_value" | sed -e 's/^["'"'"']//' -e 's/["'"'"']$//')
     [ -n "$_value" ] || return 1
     _machine_id_arg_valid "$_value" || return 2
     printf '%s\n' "$_value"
@@ -1692,6 +1775,8 @@ _write_core_args() {
 
     mkdir -p "$(dirname "$ET_CORE_ARGS_FILE")" "$ET_FILE_LOG_DIR" 2>/dev/null || true
     local _tmp="${ET_CORE_ARGS_FILE}.tmp.$$"
+    _new_private_tmp "$_tmp" || {
+        msg_err "$(t "Failed to create ${_tmp}" "创建 ${_tmp} 失败")"; return 1; }
     crit_begin
     # $1/$2 must stay on lines 1-2: _prepare_machine_id_upgrade detects Web mode
     # from the first line, so extra options are only ever appended after them.
@@ -1906,6 +1991,7 @@ _toml_write_config() {
     e_net_secret=$(_toml_escape "$_TOML_NET_SECRET")
     e_dev_name=$(_toml_escape "$_TOML_DEV_NAME")
 
+    _new_private_tmp "$_tmp" || return 1
     crit_begin
     if ! {
         printf 'instance_name = "%s"\n'  "$e_instance"
@@ -2078,9 +2164,14 @@ setup_web_console() {
     msg_info "$(t "  · local access only:      http://127.0.0.1:${api_port}" "  · 仅本地访问:           http://127.0.0.1:${api_port}")"
     msg_info "$(t "  · Cloudflare Tunnel:  https://your-domain.example.com" "  · Cloudflare Tunnel:  https://your-domain.example.com")"
     msg_info "$(t "  (after Tunnel setup, reconfigure this via 'Web console management')" "  （Tunnel 配置完成后可通过「Web 控制台管理」重新配置此项）")"
-    printf "$(t "  API Host [default http://127.0.0.1:%s]: " "  API Host [默认 http://127.0.0.1:%s]: ")" "$api_port"
-    local api_host; read -r api_host
-    [ -z "$api_host" ] && api_host="http://127.0.0.1:${api_port}"
+    local api_host
+    while true; do
+        printf "$(t "  API Host [default http://127.0.0.1:%s]: " "  API Host [默认 http://127.0.0.1:%s]: ")" "$api_port"
+        read -r api_host
+        [ -z "$api_host" ] && api_host="http://127.0.0.1:${api_port}"
+        is_valid_http_url "$api_host" && break
+        msg_warn "$(t "API Host must be an http(s):// URL without spaces or shell metacharacters" "API Host 须为不含空格与 shell 元字符的 http(s):// URL")"
+    done
 
     local db_dir; db_dir=$(dirname "$ET_WEB_DB_PATH")
     mkdir -p /etc/easytier "$db_dir" || return 1
@@ -2101,6 +2192,7 @@ setup_web_console() {
     fi
 
     local _tmp="/etc/easytier/web.args.tmp.$$"
+    _new_private_tmp "$_tmp" || return 1
     crit_begin
     if ! printf '%s\n' \
         "--db"                    "${ET_WEB_DB_PATH}" \
@@ -2496,7 +2588,7 @@ _uninstall_one() {
             msg_info "$(t "Stopping and removing the easytier service..." "停止并移除 easytier 服务...")"
             svc_stop; svc_remove
             _kill_bin easytier-core
-            ip link del easytier0 2>/dev/null || true
+            ip link del "$(_tun_dev_name)" 2>/dev/null || true
             ;;
         easytier-web-embed)
             msg_info "$(t "Stopping and removing the easytier-web service..." "停止并移除 easytier-web 服务...")"
@@ -2527,7 +2619,7 @@ _uninstall_all() {
     for bin in $ET_ALL_BINS; do
         rm -f "/usr/bin/$bin"
     done
-    ip link del easytier0 2>/dev/null || true
+    ip link del "$(_tun_dev_name)" 2>/dev/null || true
     msg_ok "$(t "Binaries and services removed" "二进制及服务已移除")"
 
     local bak_list
@@ -2680,7 +2772,7 @@ _print_header() {
         local first; first=$(head -1 /etc/easytier/core.args)
         case "$first" in
             --config-file) mode_str="$(t "TOML config file" "TOML 配置文件")" ;;
-            -w)
+            -w|--config-server)   # both spellings mean Web mode, as in _prepare_machine_id_upgrade
                 local wurl; wurl=$(sed -n '2p' /etc/easytier/core.args 2>/dev/null)
                 mode_str="$(t "Web console (${wurl})" "Web 控制台 (${wurl})")"
                 ;;
@@ -2818,6 +2910,7 @@ main() {
         msg_warn "$(t "Detected old core.args missing log params; appending --file-log-*" "检测到旧版 core.args 缺少日志参数，正在追加 --file-log-*")"
         mkdir -p "$ET_FILE_LOG_DIR" 2>/dev/null || true
         _tmp="/etc/easytier/core.args.tmp.$$"
+        _new_private_tmp "$_tmp" || return 1
         crit_begin
         { cat /etc/easytier/core.args; printf '%s\n' \
             "--file-log-dir"   "$ET_FILE_LOG_DIR" \
