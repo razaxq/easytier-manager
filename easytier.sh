@@ -216,6 +216,29 @@ die()      { msg_err "$*"; exit 1; }
 # the shell then tries to run the label.  $1 command  $2 label
 _cmd_hint() { printf "    %-38s ${C_DIM}# %s${C_RST}\n" "$1" "$2"; }
 
+# The log command for one service, per init system.
+#   $1 = binary   $2 = "recent" (default, for diagnosing) | "follow" (for watching)
+# Diagnosing a stopped service and watching a running one want different commands,
+# so the status page asks for "recent" and the reference section for "follow".
+_svc_log_cmd() {
+    local _bin="$1" _mode="${2:-recent}" _unit _file
+    case "$_bin" in
+        easytier-core) _unit=easytier;     _file=/var/log/easytier.log     ;;
+        *)             _unit=easytier-web; _file=/var/log/easytier-web.log ;;
+    esac
+    case "$INIT_SYS" in
+        procd)
+            if [ "$_mode" = follow ]; then printf 'logread -f -e %s' "$_unit"
+            else printf 'logread -e %s' "$_unit"; fi ;;
+        systemd)
+            if [ "$_mode" = follow ]; then printf 'journalctl -u %s -f' "$_unit"
+            else printf 'journalctl -u %s -n 50 --no-pager' "$_unit"; fi ;;
+        *)
+            if [ "$_mode" = follow ]; then printf 'tail -f %s' "$_file"
+            else printf 'tail -n 50 %s' "$_file"; fi ;;
+    esac
+}
+
 # Section heading
 section() {
     local title="$1"
@@ -2401,7 +2424,7 @@ do_view_status() {
     local _status_rc=0
 
     _print_svc_block() {
-        local label="$1" bin="$2" args_file="$3"
+        local label="$1" bin="$2" args_file="$3" _need_log=0
         printf "  ${C_BLD}[ %s ]${C_RST}\n" "$label"
         if _proc_running "$bin"; then
             local pid; pid=$(_proc_pid "$bin")
@@ -2411,9 +2434,14 @@ do_view_status() {
             if [ "$bin" = "easytier-core" ] || [ -f "$args_file" ]; then
                 _status_rc=1
             fi
+            # The next step belongs next to the problem, not in a fixed block at
+            # the bottom that also prints when everything is fine.
+            [ -f "$args_file" ] && _need_log=1
         fi
         [ -f "$args_file" ] && \
             printf "    $(t "Args" "参数"): ${C_DIM}%s${C_RST}\n" "$(tr '\n' ' ' < "$args_file")"
+        [ "$_need_log" = "1" ] && \
+            _cmd_hint "$(_svc_log_cmd "$bin")" "$(t "why it is not running" "查看未运行的原因")"
         # append a short systemd status summary (3 lines)
         if [ "$INIT_SYS" = "systemd" ]; then
             local svc_name
@@ -2424,7 +2452,7 @@ do_view_status() {
         printf '\n'
     }
 
-    _print_svc_block "easytier-core"      "easytier-core"      "/etc/easytier/core.args"
+    _print_svc_block "easytier-core"      "easytier-core"      "$ET_CORE_ARGS_FILE"
     _print_svc_block "easytier-web-embed" "easytier-web-embed" "/etc/easytier/web.args"
 
     # ── Network overview via easytier-cli (peers / routes) — best-effort ──
@@ -2453,29 +2481,15 @@ do_view_status() {
                 fi
             else
                 msg_info "$(t "easytier-cli cannot reach the RPC portal at $(_rpc_portal_addr); reconfigure to pin it" "easytier-cli 连不上 RPC 端口 $(_rpc_portal_addr)；重新配置即可固定")"
+                _cmd_hint "$(_svc_log_cmd easytier-core)" "$(t "core log" "core 日志")"
             fi
         fi
         printf '\n'
     fi
 
-    printf "  ${C_BLD}[ $(t "Log commands" "日志命令") ]${C_RST}\n"
-    case "$INIT_SYS" in
-        procd)
-            _cmd_hint "logread -f | grep easytier"     "easytier-core"
-            _cmd_hint "logread -f | grep easytier-web" "easytier-web"
-            ;;
-        systemd)
-            _cmd_hint "journalctl -u easytier -f" "easytier-core"
-            [ -f /etc/systemd/system/easytier-web.service ] && \
-                _cmd_hint "journalctl -u easytier-web -f" "easytier-web"
-            ;;
-        openrc)
-            _cmd_hint "tail -f /var/log/easytier.log" "easytier-core"
-            [ -f /etc/init.d/easytier-web ] && \
-                _cmd_hint "tail -f /var/log/easytier-web.log" "easytier-web"
-            ;;
-    esac
-    _cmd_hint "tail -f ${LOG_FILE}" "$(t "manager log" "脚本自身日志")"
+    # Only surface the manager's own log when something actually went wrong;
+    # the full list of paths and log commands lives in the install-info screen.
+    [ "$_status_rc" -eq 0 ] || _cmd_hint "tail -n 50 ${LOG_FILE}" "$(t "manager log" "脚本自身日志")"
     return "$_status_rc"
 }
 
@@ -2549,7 +2563,7 @@ do_manage_web() {
 #  File location display
 # ==============================================================================
 show_file_locations() {
-    section "$(t "Installed file locations" "已安装文件位置")"
+    section "$(t "Install info & disk usage" "安装信息与磁盘占用")"
 
     printf "  ${C_BLD}[ $(t "Binaries" "二进制") ]${C_RST}  /usr/bin/\n"
     for bin in $ET_ALL_BINS; do
@@ -2626,14 +2640,13 @@ show_file_locations() {
             "$ET_FILE_LOG_DIR" "${cur_log_size:-?}" \
             "$ET_FILE_LOG_SIZE" "$ET_FILE_LOG_COUNT" "$ET_FILE_LOG_LEVEL"
     fi
-    printf "  $(t "Runtime log" "运行日志"):\n"
-    case "$INIT_SYS" in
-        procd)   _cmd_hint "logread -e easytier" "easytier-core" ;;
-        systemd) _cmd_hint "journalctl -u easytier -f" "easytier-core"
-                 [ -f /etc/systemd/system/easytier-web.service ] && \
-                     _cmd_hint "journalctl -u easytier-web -f" "easytier-web" ;;
-        openrc)  _cmd_hint "tail -f /var/log/easytier.log" "easytier-core" ;;
-    esac
+    # This is the single complete log-command reference; the status page only
+    # prints the one command that matches whatever it found wrong.
+    printf "  $(t "Follow the runtime log" "实时查看运行日志"):\n"
+    _cmd_hint "$(_svc_log_cmd easytier-core follow)" "easytier-core"
+    [ -f /etc/easytier/web.args ] && \
+        _cmd_hint "$(_svc_log_cmd easytier-web-embed follow)" "easytier-web"
+    _cmd_hint "tail -f ${LOG_FILE}" "$(t "manager log" "脚本自身日志")"
 
     # old versions (< 2.1.0) without --file-log-dir wrote 100MB×10 logs to cwd
     if ls /easytier.log /easytier.log.[0-9] /easytier.log.[0-9][0-9] >/dev/null 2>&1; then
@@ -2851,6 +2864,15 @@ _print_header() {
         esac
     fi
 
+    # Core status belongs in the header: it is the one thing every visit checks,
+    # and _proc_running is already being called here for web-embed anyway.
+    local core_str=""
+    if _proc_running "easytier-core"; then
+        core_str="${C_GRN}$(t "✓ running" "✓ 运行中")${C_RST}"
+    elif [ -f /etc/easytier/core.args ]; then
+        core_str="${C_RED}$(t "✗ configured but not running" "✗ 已配置但未运行")${C_RST}"
+    fi
+
     if _proc_running "easytier-web-embed"; then
         local port=""
         [ -f /etc/easytier/web.args ] && \
@@ -2871,7 +2893,8 @@ _print_header() {
     if [ -n "$cur" ]; then
         printf "  $(t "Version" "版本")  %s\n" "$cur"
         printf "  $(t "Config " "配置")  %s\n" "$mode_str"
-        [ -n "$web_str" ] && printf "  Web   %s\n" "$web_str"
+        [ -n "$core_str" ] && printf "  Core  %s\n" "$core_str"
+        [ -n "$web_str" ]  && printf "  Web   %s\n" "$web_str"
     else
         printf "  ${C_YLW}$(t "Status  not installed" "状态  未安装")${C_RST}\n"
     fi
@@ -3013,7 +3036,7 @@ main() {
             printf "  ${C_BLD}5)${C_RST}  $(t "Web console management" "Web 控制台管理")\n"
             printf "  ${C_DIM}── $(t "Maintenance" "安装维护") ──${C_RST}\n"
             printf "  ${C_BLD}6)${C_RST}  $(t "Update / reinstall (choose version)" "更新 / 重装（选择版本）")\n"
-            printf "  ${C_BLD}7)${C_RST}  $(t "File locations & logs" "文件位置与日志")\n"
+            printf "  ${C_BLD}7)${C_RST}  $(t "Install info & disk usage" "安装信息与磁盘占用")\n"
             printf "  ${C_BLD}8)${C_RST}  $(t "Uninstall EasyTier" "卸载 EasyTier")\n"
             printf "\n"
             printf "  ${C_BLD}0)${C_RST}  $(t "Exit" "退出")\n"
@@ -3156,7 +3179,7 @@ main() {
                 show_file_locations
                 ;;
 
-            # ── File locations & logs ───────────────────────────────────
+            # ── Install info & disk usage ───────────────────────────────
             7) show_file_locations ;;
 
             # ── Uninstall ────────────────────────────────────────────────
