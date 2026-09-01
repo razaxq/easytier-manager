@@ -2154,9 +2154,21 @@ setup_web_console() {
     msg_info "$(t "  tcp — better NAT traversal" "  tcp — 穿透性更好")"
     msg_info "$(t "  ws  — good behind an HTTP reverse proxy; if Cloudflare Tunnel upgrades ws to wss," "  ws  — 适合 HTTP 反向代理；若 Cloudflare Tunnel 将 ws 升级为 wss，")"
     msg_info "$(t "        then easytier-core should join with wss (not ws)" "        则 easytier-core 接入时协议应填 wss（而非 ws）")"
-    printf '%s' "$(t "  Protocol (tcp/udp/ws) [default udp]: " "  协议 (tcp/udp/ws) [默认 udp]: ")"
-    local cfg_proto; read -r cfg_proto
-    case "$cfg_proto" in tcp|udp|ws) ;; *) cfg_proto=udp ;; esac
+    # Loop like every other prompt here: silently substituting the default hides a
+    # typo, and the join URL entered later would then not match the serving protocol.
+    local cfg_proto
+    while true; do
+        printf '%s' "$(t "  Protocol (tcp/udp/ws) [default udp]: " "  协议 (tcp/udp/ws) [默认 udp]: ")"
+        read -r cfg_proto
+        [ -z "$cfg_proto" ] && cfg_proto=udp
+        case "$cfg_proto" in tcp|udp|ws) break ;; esac
+        msg_warn "$(t "Enter one of tcp / udp / ws — this is the protocol only, not a URL" "请输入 tcp / udp / ws 之一——此处只填协议，不是 URL")"
+        case "$cfg_proto" in
+            wss|wss://*|ws://*|tcp://*|udp://*)
+                msg_info "$(t "For a TLS-terminating tunnel choose ws here; the wss:// join URL is asked for later" "若使用 TLS 终止的隧道，此处选 ws；wss:// 接入 URL 会在后面单独询问")"
+                ;;
+        esac
+    done
 
     # ── API Host ────────────────────────────
     printf '\n'
