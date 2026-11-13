@@ -20,8 +20,12 @@ permissions:
   contents: read
 
 jobs:
-  latest-stable:
-    name: Latest stable EasyTier
+  compatibility:
+    name: EasyTier ${{ matrix.channel }}
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [stable, prerelease, nightly]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -29,5 +33,6 @@ jobs:
 
       - name: Verify release assets, CLI, and generated config
         env:
+          ET_TEST_CHANNEL: ${{ matrix.channel }}
           ET_GITHUB_TOKEN: ${{ github.token }}
         run: sh tests/test_upstream_compat.sh

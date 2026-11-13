@@ -22,7 +22,7 @@
 #    Arch Linux / Manjaro  (systemd)
 #    Alpine Linux  (openrc)
 #  Supported archs: x86_64 / aarch64 / armv7 / armv7hf / arm / armhf / riscv64 /
-#                   loongarch64 / mips / mipsel   (ARM float ABI is auto-detected)
+#                   loongarch64 / mips / mipsel / ppc64le   (ARM float ABI is auto-detected)
 # ------------------------------------------------------------------------------
 #  Non-interactive install (preset all params via env vars):
 #    ET_NONINTERACTIVE=1         — skip all prompts, use defaults or the vars below
@@ -59,7 +59,7 @@
 #    ET_ENABLE_EXIT_NODE=1                 — allow this node to act as an exit node (default 0)
 #    ET_USE_SMOLTCP=1                      — use smoltcp for TCP proxying (default 0)
 #    ET_PRIVATE_MODE=0                     — accept foreign networks (default 1)
-#    ET_DATA_COMPRESS_ALGO=0|1|2           — compression algorithm (default 0 / none)
+#    ET_DATA_COMPRESS_ALGO=0|1|2|3           — compression algorithm (default 0 / none)
 #    ET_WEB_BIND_ADDR=0.0.0.0              — expose the self-hosted Web UI (default 127.0.0.1)
 #    ET_WEB_DB_PATH=/var/lib/easytier-web/et.db — fixed Web database path
 #    ET_RPC_PORTAL=127.0.0.1:15888         — easytier-cli control socket; empty = upstream default
@@ -68,7 +68,7 @@
 #     are auto-tightened by main() (values you set explicitly still win)
 # ==============================================================================
 
-SCRIPT_VERSION="2.7.1"
+SCRIPT_VERSION="2.8.0"
 
 # ── Tunables ──────────────────────────────────────────
 # These sentinels record whether the user set the vars explicitly; after detect_system, on procd we
@@ -76,6 +76,7 @@ SCRIPT_VERSION="2.7.1"
 _u_backup=${ET_BACKUP_KEEP:+1}
 _u_lsize=${ET_FILE_LOG_SIZE:+1}
 _u_lcount=${ET_FILE_LOG_COUNT:+1}
+_u_upkeep=${ET_UPGRADE_BACKUP_KEEP:+1}
 _u_machine_state=${ET_MACHINE_ID_STATE_FILE+x}
 
 ET_BACKUP_KEEP="${ET_BACKUP_KEEP:-3}"           # backups kept per binary
@@ -87,7 +88,7 @@ ET_ALLOW_PRERELEASE="${ET_ALLOW_PRERELEASE:-0}"
 ET_ALLOW_UNVERIFIED="${ET_ALLOW_UNVERIFIED:-0}"
 ET_ARCH="${ET_ARCH:-}"
 LOG_FILE="${LOG_FILE:-/var/log/easytier-manager.log}"
-TMP_DIR="/tmp/et_mgr_$$"
+TMP_DIR=""  # main creates a private directory; sourced tests provide their own
 
 # GitHub access — mirror/proxy/token/integrity/cache (all optional; empty = plain github.com)
 ET_GITHUB_API="${ET_GITHUB_API:-https://api.github.com}"   # API base (override for a mirror)
@@ -124,6 +125,9 @@ ET_DATA_COMPRESS_ALGO="${ET_DATA_COMPRESS_ALGO:-0}"
 # bind addresses must be passed explicitly. Keep the administration UI local by default.
 ET_WEB_BIND_ADDR="${ET_WEB_BIND_ADDR:-127.0.0.1}"
 ET_WEB_DB_PATH="${ET_WEB_DB_PATH:-/var/lib/easytier-web/et.db}"
+ET_WEB_ARGS_FILE="${ET_WEB_ARGS_FILE:-/etc/easytier/web.args}"
+ET_UPGRADE_BACKUP_DIR="${ET_UPGRADE_BACKUP_DIR:-/var/lib/easytier-manager/backups}"
+ET_UPGRADE_BACKUP_KEEP="${ET_UPGRADE_BACKUP_KEEP:-2}"
 
 # easytier-core RPC portal (the local control socket easytier-cli talks to).
 # `rpc_portal` is NOT a TOML config key — upstream only accepts the --rpc-portal
@@ -150,6 +154,14 @@ INIT_SYS=""     # procd | systemd | openrc | unknown
 ARCH_NAME=""    # x86_64 | aarch64 | armv7 | riscv64 | unknown
 VER=""          # selected version (set by select_version; falls back to $ET_DEFAULT_VERSION)
 EXTRACT_DIR=""  # extraction dir (set by do_download)
+DOWNLOAD_VERSION=""  # package version, distinct from a rolling release tag
+BIN_DIR="/usr/bin"  # fixed in production; isolated by installer tests
+SYSTEMD_DIR="/etc/systemd/system"
+INIT_DIR="/etc/init.d"
+UPGRADE_SNAPSHOT=""
+_UPGRADE_PENDING=""  # snapshot directory still being written
+_UPGRADE_CORE_RUNNING=0
+_UPGRADE_WEB_RUNNING=0
 KEEP_BACKUP=0   # do_install_bins decides whether to back up; _install_extra_bin reuses it
 
 # TOML wizard temp vars
@@ -280,6 +292,7 @@ _log() {
 # ==============================================================================
 _cleanup() {
     rm -rf "$TMP_DIR" 2>/dev/null || true
+    [ -z "${_UPGRADE_PENDING:-}" ] || rm -rf "$_UPGRADE_PENDING" 2>/dev/null || true
     # fallback cleanup of THIS run's atomic-write temp files only (named *.tmp.$$),
     # so a concurrent instance's in-flight temp files are never clobbered
     rm -f /etc/easytier/*.tmp.$$      /usr/bin/*.tmp.$$ \
@@ -419,7 +432,7 @@ _arm_hard_float() {
 _detect_arch() {
     if [ -n "$ET_ARCH" ]; then
         case "$ET_ARCH" in
-            x86_64|aarch64|arm|armhf|armv7|armv7hf|riscv64|loongarch64|mips|mipsel)
+            x86_64|aarch64|arm|armhf|armv7|armv7hf|riscv64|loongarch64|mips|mipsel|ppc64le)
                 ARCH_NAME="$ET_ARCH"; return 0 ;;
             *)
                 ARCH_NAME="unknown"
@@ -439,6 +452,7 @@ _detect_arch() {
         armv6l|armv6|arm)
             if _arm_hard_float; then ARCH_NAME="armhf"; else ARCH_NAME="arm"; fi
             ;;
+        ppc64le|powerpc64le) ARCH_NAME="ppc64le" ;;
         riscv64)            ARCH_NAME="riscv64" ;;
         loongarch64)        ARCH_NAME="loongarch64" ;;
         mips)               ARCH_NAME="mips" ;;
@@ -497,14 +511,28 @@ _kill_bin() {
 
 # Run easytier-cli <args…> with a short timeout (avoids hanging if the RPC portal is down).
 # Prints stdout only; caller decides what to do with empty output.
+# Run an upstream program (or a service launcher) without this script's ET_*
+# settings in its environment. EasyTier reads identically named variables with
+# different syntax: an exported ET_DHCP=1 or ET_PRIVATE_MODE=0 makes
+# easytier-core reject its command line ("possible values: true, false"), and
+# others would silently override the generated configuration.
+_without_et_env() {
+    (
+        for _v in $(env | sed -n 's/^\(ET_[A-Za-z0-9_]*\)=.*/\1/p'); do
+            unset "$_v" 2>/dev/null || true
+        done
+        exec "$@"
+    )
+}
+
 _cli() {
     [ -x /usr/bin/easytier-cli ] || return 1
     local _portal; _portal=$(_rpc_portal_addr)
     [ -z "$_portal" ] || set -- -p "$_portal" "$@"
     if command -v timeout > /dev/null 2>&1; then
-        timeout 5 /usr/bin/easytier-cli "$@" 2>/dev/null
+        _without_et_env timeout 5 /usr/bin/easytier-cli "$@" 2>/dev/null
     else
-        /usr/bin/easytier-cli "$@" 2>/dev/null
+        _without_et_env /usr/bin/easytier-cli "$@" 2>/dev/null
     fi
 }
 
@@ -694,7 +722,7 @@ _is_uint() { printf '%s' "$1" | grep -qE '^[0-9]+$'; }
 
 _validate_tunables() {
     local _name _value
-    for _name in ET_BACKUP_KEEP ET_RELEASES_COUNT ET_CACHE_TTL ET_FILE_LOG_SIZE ET_FILE_LOG_COUNT ET_MIN_TMP_MB; do
+    for _name in ET_UPGRADE_BACKUP_KEEP ET_BACKUP_KEEP ET_RELEASES_COUNT ET_CACHE_TTL ET_FILE_LOG_SIZE ET_FILE_LOG_COUNT ET_MIN_TMP_MB; do
         eval "_value=\${${_name}}"
         if ! _is_uint "$_value"; then
             msg_err "$(t "${_name} must be a non-negative integer" "${_name} 必须为非负整数")"
@@ -720,9 +748,11 @@ _validate_tunables() {
             *) msg_err "$(t "${_name} must be 0 or 1 (got: $_value)" "${_name} 必须为 0 或 1（当前: $_value）")"; return 1 ;;
         esac
     done
-    case "$ET_DATA_COMPRESS_ALGO" in 0|1|2) ;;
-        *) msg_err "$(t "ET_DATA_COMPRESS_ALGO must be 0, 1 or 2" "ET_DATA_COMPRESS_ALGO 必须为 0、1 或 2")"; return 1 ;;
+    case "$ET_DATA_COMPRESS_ALGO" in 0|1|2|3) ;;
+        *) msg_err "$(t "ET_DATA_COMPRESS_ALGO must be 0, 1, 2 or 3" "ET_DATA_COMPRESS_ALGO 必须为 0、1、2 或 3")"; return 1 ;;
     esac
+    [ "$ET_UPGRADE_BACKUP_KEEP" -ge 1 ] && is_safe_data_path "$ET_UPGRADE_BACKUP_DIR" || {
+        msg_err "$(t "Upgrade backups need a safe absolute directory and retention >= 1" "升级备份需使用安全的绝对目录，保留数量须至少为 1")"; return 1; }
     is_valid_web_bind_addr "$ET_WEB_BIND_ADDR" || {
         msg_err "$(t "Invalid ET_WEB_BIND_ADDR: $ET_WEB_BIND_ADDR (use 127.0.0.1, 0.0.0.0, ::1 or ::)" "ET_WEB_BIND_ADDR 无效: $ET_WEB_BIND_ADDR（请使用 127.0.0.1、0.0.0.0、::1 或 ::）")"; return 1; }
     is_valid_rpc_portal "$ET_RPC_PORTAL" || {
@@ -851,9 +881,11 @@ _svc_stop() {
 _svc_start() {
     local name="$1"
     case "$INIT_SYS" in
-        procd)   "/etc/init.d/$name" enable && "/etc/init.d/$name" start ;;
-        systemd) systemctl daemon-reload && systemctl enable "$name" && systemctl start "$name" ;;
-        openrc)  rc-update add "$name" default 2>/dev/null; rc-service "$name" start ;;
+        # launchers run without ET_*: an init system that passes the caller's
+        # environment through must not hand installer settings to the daemon
+        procd)   "/etc/init.d/$name" enable && _without_et_env "/etc/init.d/$name" start ;;
+        systemd) systemctl daemon-reload && systemctl enable "$name" && _without_et_env systemctl start "$name" ;;
+        openrc)  rc-update add "$name" default 2>/dev/null; _without_et_env rc-service "$name" start ;;
         *) return 1 ;;
     esac
 }
@@ -861,9 +893,9 @@ _svc_start() {
 _svc_restart() {
     local name="$1"
     case "$INIT_SYS" in
-        procd)   "/etc/init.d/$name" restart ;;
-        systemd) systemctl restart "$name" ;;
-        openrc)  rc-service "$name" restart ;;
+        procd)   _without_et_env "/etc/init.d/$name" restart ;;
+        systemd) _without_et_env systemctl restart "$name" ;;
+        openrc)  _without_et_env rc-service "$name" restart ;;
         *) return 1 ;;
     esac
 }
@@ -1003,10 +1035,10 @@ EOF
 #  Service file writer — web-embed
 # ==============================================================================
 svc_write_web() {
-    [ -f /etc/easytier/web.args ] || { msg_err "$(t "web.args not found" "web.args 不存在")"; return 1; }
+    [ -f "${ET_WEB_ARGS_FILE}" ] || { msg_err "$(t "web.args not found" "web.args 不存在")"; return 1; }
 
     local args_line args_line_systemd
-    args_line=$(tr '\n' ' ' < /etc/easytier/web.args | sed 's/[[:space:]]*$//')
+    args_line=$(tr '\n' ' ' < "${ET_WEB_ARGS_FILE}" | sed 's/[[:space:]]*$//')
     args_line_systemd=$(_systemd_escape_args "$args_line")
 
     # Let systemd own the database directory, but only when it actually lives under
@@ -1032,12 +1064,12 @@ START=98
 STOP=11
 USE_PROCD=1
 start_service() {
-    [ -f /etc/easytier/web.args ] || return 1
+    [ -f "${ET_WEB_ARGS_FILE}" ] || return 1
     procd_open_instance
     procd_set_param command /usr/bin/easytier-web-embed
     while IFS= read -r _arg; do
         [ -n "\$_arg" ] && procd_append_param command "\$_arg"
-    done < /etc/easytier/web.args
+    done < "${ET_WEB_ARGS_FILE}"
     procd_set_param respawn 60 5 5
     procd_set_param stdout 1
     procd_set_param stderr 1
@@ -1138,24 +1170,205 @@ _download_urls() {
 # Fetch a GitHub API URL; adds an auth header when a token is set. Prints body, returns curl status.
 _gh_api() {
     if [ -n "$ET_GITHUB_TOKEN" ]; then
-        curl -sf --connect-timeout 10 \
+        curl -sf --connect-timeout 10 --max-time 60 \
             -H "Authorization: Bearer $ET_GITHUB_TOKEN" \
             -H "X-GitHub-Api-Version: 2022-11-28" "$1"
     else
-        curl -sf --connect-timeout 10 "$1"
+        curl -sf --connect-timeout 10 --max-time 60 "$1"
     fi
 }
 
-# Verify a file's sha256 against an expected hex (case-insensitive).
-_verify_sha256() {
-    local f="$1" want="$2" got=""
+# Read JSON structurally without jq/Python. Values remain JSON-encoded; callers
+# only consume ASCII tags, asset names, URLs and booleans. Nested uploader/body
+# fields cannot impersonate release fields, and compact JSON works too.
+# The tokenizer only ever touches a small window (buf) that is refilled in 4 KB
+# chunks, so cost stays linear even on awks whose substr()/length() scan the
+# whole string (BusyBox). Regexes avoid intervals and POSIX classes, which old
+# mawk releases do not implement.
+_json_fields() {
+    LC_ALL=C awk '
+        function bad() { failed=1; exit 1 }
+        function more() {
+            if (poff > plen) {
+                if ((getline pend) <= 0) return 0
+                pend=pend "\n"; plen=length(pend); poff=1
+            }
+            buf=buf substr(pend, poff, 4096); poff+=4096
+            return 1
+        }
+        function take(n,    token) { token=substr(buf,1,n); buf=substr(buf,n+1); return token }
+        function next_char() {
+            while (1) {
+                sub(/^[ \t\r\n]+/, "", buf)
+                if (buf != "" || !more()) return substr(buf,1,1)
+            }
+        }
+        function string(    token) {
+            while (!match(buf, /^"([^"\\]|\\.)*"/)) if (!more()) bad()
+            token=take(RLENGTH)
+            if (token ~ ctl) bad()
+            if (token !~ /^"([^"\\]|\\(["\\\/bfnrt]|u[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]))*"$/) bad()
+            return token
+        }
+        function scalar() {
+            # wait for a delimiter so a chunk boundary can never split a literal
+            while (buf !~ /[],} \t\r\n]/) if (!more()) break
+            if (!match(buf, num)) bad()
+            return take(RLENGTH)
+        }
+        function value(path, depth,    c, key, i, token) {
+            if (depth > 64) bad()
+            c=next_char()
+            if (c == "{") {
+                take(1)
+                if (next_char() == "}") { take(1); return }
+                while (1) {
+                    if (next_char() != "\"") bad()
+                    key=string(); key=substr(key,2,length(key)-2)
+                    if (next_char() != ":") bad()
+                    take(1)
+                    value(path "/" key, depth+1)
+                    c=next_char(); take(1)
+                    if (c == "}") return
+                    if (c != ",") bad()
+                }
+            } else if (c == "[") {
+                take(1); i=0
+                if (next_char() == "]") { take(1); return }
+                while (1) {
+                    value(path "/" i++, depth+1)
+                    c=next_char(); take(1)
+                    if (c == "]") return
+                    if (c != ",") bad()
+                }
+            } else if (c == "\"") {
+                token=string()
+            } else {
+                token=scalar()
+            }
+            print path "\t" token
+        }
+        BEGIN {
+            ctl="["; for (n=1; n<32; n++) ctl=ctl sprintf("%c", n); ctl=ctl "]"
+            num="^(true|false|null|-?[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?)"
+            buf=""; pend=""; poff=1; plen=0
+            value("", 0)
+            if (next_char() != "") bad()
+        }
+    '
+}
+
+_release_rows() {
+    local fields
+    fields=$(_json_fields) || return 1
+    printf '%s\n' "$fields" | awk -F '\t' '
+        function unquote(s) { return substr(s,2,length(s)-2) }
+        $1 ~ /^\/[0-9]+\/(tag_name|prerelease|draft|published_at|updated_at)$/ {
+            split($1,p,"/"); n=p[2]+0; v=$2
+            if (n > max) max=n
+            if (p[3]=="tag_name") tag[n]=unquote(v)
+            if (p[3]=="prerelease") pre[n]=v
+            if (p[3]=="draft") draft[n]=v
+            if (p[3]=="published_at" && v!="null") date[n]=substr(unquote(v),1,10)
+            if (p[3]=="updated_at" && v!="null") updated[n]=substr(unquote(v),1,10)
+        }
+        END {
+            for (i=0;i<=max;i++) {
+                if (draft[i]=="true" || date[i]=="" || (pre[i]!="true" && pre[i]!="false")) continue
+                if (tag[i]=="nightly") print tag[i], "nightly", (updated[i]!="" ? updated[i] : date[i])
+                else if (tag[i] ~ /^v?[0-9]+\.[0-9]+(\.[0-9]+)?([._+-][0-9A-Za-z.]+)?$/)
+                    print tag[i], (pre[i]=="true" ? "pre" : "stable"), date[i]
+            }
+        }
+    '
+}
+
+# One official response supplies both the download URL and its expected digest.
+# Never construct a nightly filename from the release tag or trust a mirror
+# for metadata. A rolling tag changing during download fails checksum validation.
+_resolve_release_asset() {
+    local tag="$1" arch="$2" json fields row prefix
+    ASSET_NAME=""; ASSET_URL=""; ASSET_SHA256=""; DOWNLOAD_VERSION=""
+    is_valid_version_tag "$tag" || return 1
+    case "$arch" in x86_64|aarch64|arm|armhf|armv7|armv7hf|riscv64|loongarch64|mips|mipsel|ppc64le) ;; *) return 1 ;; esac
+    if ! json=$(_gh_api "${ET_GITHUB_DIGEST_API}/repos/EasyTier/EasyTier/releases/tags/${tag}"); then
+        # API unreachable or rate-limited. A versioned tag has a predictable asset
+        # name, so the download can still proceed; with no official digest the
+        # caller then insists on ET_SHA256 or ET_ALLOW_UNVERIFIED=1. A rolling
+        # tag has no predictable filename and cannot be resolved offline.
+        [ "$tag" != nightly ] || return 2
+        ASSET_NAME="easytier-linux-${arch}-${tag}.zip"
+        ASSET_URL="https://github.com/EasyTier/EasyTier/releases/download/${tag}/${ASSET_NAME}"
+        DOWNLOAD_VERSION=${tag#v}
+        msg_warn "$(t "GitHub API unreachable; using the standard asset name without an official digest" "无法访问 GitHub API；按标准资产名下载，无法取得官方摘要")"
+        return 0
+    fi
+    fields=$(printf '%s\n' "$json" | _json_fields) || return 1
+    row=$(printf '%s\n' "$fields" | awk -F '\t' -v tag="$tag" -v arch="$arch" '
+        function unquote(s) { return substr(s,2,length(s)-2) }
+        $1=="/tag_name" { actual=unquote($2) }
+        $1=="/draft" { draft=$2 }
+        $1 ~ /^\/assets\/[0-9]+\/(name|digest|browser_download_url)$/ {
+            split($1,p,"/"); i=p[3]+0
+            if (i>max) max=i
+            if (p[4]=="name") name[i]=unquote($2)
+            if (p[4]=="digest" && $2!="null") digest[i]=unquote($2)
+            if (p[4]=="browser_download_url") url[i]=unquote($2)
+        }
+        END {
+            if (actual!=tag || draft=="true") exit 1
+            prefix="easytier-linux-" arch "-"
+            for (i=0;i<=max;i++) {
+                if (index(name[i],prefix)!=1) continue
+                ver=substr(name[i],length(prefix)+1)
+                if (ver !~ /^v?[0-9]+\.[0-9]+(\.[0-9]+)?([._+-][0-9A-Za-z.]+)?\.zip$/) continue
+                if (tag!="nightly" && name[i]!=prefix tag ".zip") continue
+                expected="https://github.com/EasyTier/EasyTier/releases/download/" tag "/" name[i]
+                if (url[i]!=expected) continue
+                count++; result=name[i] "|" url[i] "|" digest[i]
+            }
+            if (count!=1) exit 1
+            print result
+        }
+    ') || return 1
+    ASSET_NAME=${row%%|*}; row=${row#*|}
+    ASSET_URL=${row%%|*}; ASSET_SHA256=${row#*|}
+    ASSET_SHA256=${ASSET_SHA256#sha256:}
+    if ! printf '%s' "$ASSET_SHA256" | grep -qE '^[0-9a-fA-F]{64}$'; then ASSET_SHA256=""; fi
+    prefix="easytier-linux-${arch}-"
+    DOWNLOAD_VERSION=${ASSET_NAME#"$prefix"}; DOWNLOAD_VERSION=${DOWNLOAD_VERSION%.zip}
+    DOWNLOAD_VERSION=${DOWNLOAD_VERSION#v}
+}
+
+# Compare a reported core version ("2.7.0-3b32aaff-20261112") with a package version.
+_version_matches() {
+    local actual="$1" expected="${2#v}"
+    [ -n "$actual" ] && [ "${actual%%-*}" = "${expected%%-*}" ]
+}
+
+_core_version_matches() {
+    local output
+    output=$("$1" --version 2>/dev/null) || return 1
+    _version_matches "$(printf '%s\n' "$output" | awk '{print $2}')" "$2"
+}
+
+_sha256_file() {
+    local f="$1" got=""
     if command -v sha256sum > /dev/null 2>&1; then
         got=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
     elif command -v shasum > /dev/null 2>&1; then
         got=$(shasum -a 256 "$f" 2>/dev/null | awk '{print $1}')
     elif command -v openssl > /dev/null 2>&1; then
         got=$(openssl dgst -sha256 "$f" 2>/dev/null | awk '{print $NF}')
-    else
+    fi
+    printf '%s' "$got" | grep -qE '^[0-9a-fA-F]{64}$' || return 1
+    printf '%s\n' "$got" | tr 'A-F' 'a-f'
+}
+
+# Verify a file's sha256 against an expected hex (case-insensitive).
+_verify_sha256() {
+    local f="$1" want="$2" got=""
+    if ! got=$(_sha256_file "$f"); then
         if [ "$ET_ALLOW_UNVERIFIED" = "1" ]; then
             msg_warn "$(t "No sha256 tool available; proceeding because ET_ALLOW_UNVERIFIED=1" "无 sha256 工具；因 ET_ALLOW_UNVERIFIED=1 继续")"
             return 0
@@ -1171,28 +1384,263 @@ _verify_sha256() {
     return 1
 }
 
-# Return the official GitHub SHA-256 digest for one release asset. The digest
-# endpoint intentionally does not follow ET_GITHUB_API: download mirrors must
-# not be able to provide both the payload and its trust decision.
-_release_sha256() {
-    local ver="$1" asset="$2" api json digest
-    api="${ET_GITHUB_DIGEST_API%/}/repos/EasyTier/EasyTier/releases/tags/${ver}"
-    json=$(_gh_api "$api") || return 1
-    # "digest" precedes "browser_download_url" inside a release asset, so that key
-    # marks the end of the asset we matched. Without the reset, an asset published
-    # before GitHub added digests would silently borrow the next asset's digest.
-    digest=$(printf '%s\n' "$json" | awk -v target="$asset" '
-        index($0, "\"browser_download_url\"") { found=0; next }
-        index($0, "\"name\"") && index($0, "\"" target "\"") { found=1; next }
-        found && index($0, "\"digest\"") {
-            value=$0
-            sub(/.*"digest"[[:space:]]*:[[:space:]]*"sha256:/, "", value)
-            sub(/".*/, "", value)
-            if (value ~ /^[0-9a-fA-F]+$/ && length(value) == 64) { print value; exit }
-        }
-    ')
-    [ -n "$digest" ] || return 1
-    printf '%s\n' "$digest"
+# Web upgrades may migrate SQLite schemas. A cold snapshot always includes the
+# database sidecars, matching binaries, configuration and service definitions.
+# These backups are independent of optional per-binary .bak files.
+_web_db_path() {
+    local db=""
+    if [ -f "$ET_WEB_ARGS_FILE" ]; then
+        db=$(awk '
+            take { if ($0=="" || $0 ~ /^--/) exit 2; print; found=1; take=0; next }
+            $0=="--db" { if (found) exit 2; take=1; next }
+            /^--db=/ { if (found) exit 2; sub(/^--db=/, ""); print; found=1 }
+            END { if (take) exit 2 }
+        ' "$ET_WEB_ARGS_FILE") || return 1
+        # Historical units used the upstream relative database in their cwd (/).
+        [ -n "$db" ] || db=/et.db
+    else
+        db="$ET_WEB_DB_PATH"
+    fi
+    _snapshot_file_path "$db" || return 1
+    printf '%s\n' "$db"
+}
+
+_snapshot_file_path() {
+    case "$1" in *'|'*|*'*'*|*'?'*|*'['*|*']'*|*/.) return 1 ;; esac
+    case "$1" in /et.db|/et.db-wal|/et.db-shm|/et.db-journal) ;; *) is_safe_data_path "$1" || return 1 ;; esac
+    [ ! -L "$1" ] && { [ ! -e "$1" ] || [ -f "$1" ]; }
+}
+
+_snapshot_targets() {
+    local bin
+    for bin in $ET_ALL_BINS; do printf '%s|%s|755\n' "$bin" "$BIN_DIR/$bin"; done
+    printf '%s|%s|600\n' core.args "$ET_CORE_ARGS_FILE" web.args "$ET_WEB_ARGS_FILE" \
+        config.toml "$ET_CORE_CONFIG_FILE" machine_id "$ET_MACHINE_ID_STATE_FILE" \
+        database "$1" database-wal "$1-wal" database-shm "$1-shm" database-journal "$1-journal"
+    printf '%s\n' \
+        "core.service|$ET_CORE_SERVICE_FILE|644" \
+        "web.service|$SYSTEMD_DIR/easytier-web.service|644" \
+        "core.init|$INIT_DIR/easytier|755" \
+        "web.init|$INIT_DIR/easytier-web|755"
+}
+
+# Stop both managed services and wait for the processes to exit. Never restarts
+# anything: callers decide whether the on-disk state is fit to run.
+_halt_upgrade_services() {
+    svc_stop_web; svc_stop
+    local attempt=0
+    while _proc_running easytier-core || _proc_running easytier-web-embed; do
+        attempt=$((attempt+1))
+        if [ "$attempt" -ge 10 ]; then
+            msg_err "$(t "Services did not stop; refusing to continue with live processes" "服务未停止；拒绝在进程仍运行时继续")"
+            return 1
+        fi
+        sleep 1
+    done
+}
+
+# $1 = "db" when the Web database is about to be copied or replaced.
+_stop_upgrade_services() {
+    # A separately launched non-embedded backend could share the same DB. The
+    # manager does not control it, so refuse before touching any service; a
+    # core-only upgrade never copies the database and is not affected.
+    if [ "${1:-}" = db ] && _proc_running easytier-web; then
+        msg_err "$(t "A separate easytier-web process is running; stop it before upgrading" "另有 easytier-web 进程正在运行；请先停止它再升级")"
+        return 1
+    fi
+    _UPGRADE_CORE_RUNNING=0; _UPGRADE_WEB_RUNNING=0
+    _proc_running easytier-core && _UPGRADE_CORE_RUNNING=1
+    _proc_running easytier-web-embed && _UPGRADE_WEB_RUNNING=1
+    if ! _halt_upgrade_services; then
+        _resume_upgrade_services || true
+        return 1
+    fi
+}
+
+_resume_upgrade_services() {
+    local result=0
+    if [ "$_UPGRADE_CORE_RUNNING" = 1 ]; then svc_start && check_proc easytier-core easytier-core || result=1; fi
+    if [ "$_UPGRADE_WEB_RUNNING" = 1 ]; then svc_start_web && check_proc easytier-web-embed easytier-web-embed || result=1; fi
+    return "$result"
+}
+
+_create_upgrade_snapshot() {
+    local db="$1" pending final need_mb have_mb
+    _snapshot_file_path "$db" || return 1
+    is_safe_data_path "$ET_UPGRADE_BACKUP_DIR" && [ ! -L "$ET_UPGRADE_BACKUP_DIR" ] || return 1
+    mkdir -p "$ET_UPGRADE_BACKUP_DIR" && chmod 700 "$ET_UPGRADE_BACKUP_DIR" || return 1
+    # The snapshot duplicates every installed binary plus the database; on
+    # OpenWrt the default directory is RAM-backed. Fail before copying anything.
+    need_mb=$(_snapshot_targets "$db" | {
+        total=0
+        while IFS='|' read -r key target mode; do
+            [ -f "$target" ] || continue
+            size=$(du -k "$target" 2>/dev/null | awk '{print $1+0; exit}')
+            total=$((total + ${size:-0}))
+        done
+        printf '%s\n' $((total / 1024 + 1))
+    })
+    have_mb=$(_avail_mb "$ET_UPGRADE_BACKUP_DIR")
+    if [ -n "$have_mb" ] && [ "$have_mb" -lt "${need_mb:-1}" ]; then
+        msg_err "$(t "Not enough space for the upgrade snapshot in ${ET_UPGRADE_BACKUP_DIR}: ${have_mb}MB free / ~${need_mb}MB needed (set ET_UPGRADE_BACKUP_DIR)" "${ET_UPGRADE_BACKUP_DIR} 空间不足以保存升级快照：可用 ${have_mb}MB / 需要约 ${need_mb}MB（可设置 ET_UPGRADE_BACKUP_DIR）")"
+        return 1
+    fi
+    pending=$(mktemp -d "$ET_UPGRADE_BACKUP_DIR/.pending.XXXXXX") || return 1
+    _UPGRADE_PENDING="$pending"   # removed by _cleanup if we are interrupted mid-copy
+    final="$ET_UPGRADE_BACKUP_DIR/upgrade-$(date -u +%Y%m%dT%H%M%SZ)-${pending##*.}"
+    if ! (
+        umask 077
+        mkdir "$pending/files" "$pending/absent" "$pending/hashes" || exit 1
+        printf '%s\n' "$db" > "$pending/database.path" || exit 1
+        printf '%s\n' "$_UPGRADE_CORE_RUNNING" > "$pending/core.running" || exit 1
+        printf '%s\n' "$_UPGRADE_WEB_RUNNING" > "$pending/web.running" || exit 1
+        _snapshot_targets "$db" > "$pending/targets" || exit 1
+        while IFS='|' read -r key target mode; do
+            _snapshot_file_path "$target" || exit 1
+            if [ -f "$target" ]; then
+                cp -p "$target" "$pending/files/$key" && chmod 600 "$pending/files/$key" || exit 1
+                _sha256_file "$pending/files/$key" > "$pending/hashes/$key" || exit 1
+            else
+                : > "$pending/absent/$key" || exit 1
+            fi
+        done < "$pending/targets"
+        printf '1\n' > "$pending/format" || exit 1
+    ); then
+        rm -rf "$pending"; _UPGRADE_PENDING=""
+        return 1
+    fi
+    mv "$pending" "$final" || { rm -rf "$pending"; _UPGRADE_PENDING=""; return 1; }
+    _UPGRADE_PENDING=""
+    UPGRADE_SNAPSHOT="$final"
+}
+
+_validate_upgrade_snapshot() {
+    local snapshot="$1" db expected key target mode want got state
+    is_safe_data_path "$snapshot" && [ ! -L "$snapshot" ] && [ -d "$snapshot" ] || return 1
+    for key in files absent hashes; do
+        [ -d "$snapshot/$key" ] && [ ! -L "$snapshot/$key" ] || return 1
+    done
+    for key in format database.path targets core.running web.running; do
+        [ -f "$snapshot/$key" ] && [ ! -L "$snapshot/$key" ] || return 1
+    done
+    [ "$(cat "$snapshot/format")" = 1 ] || return 1
+    db=$(cat "$snapshot/database.path")
+    _snapshot_file_path "$db" || return 1
+    expected=$(_snapshot_targets "$db") || return 1
+    [ "$expected" = "$(cat "$snapshot/targets")" ] || return 1
+    for key in core.running web.running; do
+        state=$(cat "$snapshot/$key")
+        case "$state" in 0|1) ;; *) return 1 ;; esac
+    done
+    while IFS='|' read -r key target mode; do
+        _snapshot_file_path "$target" || return 1
+        [ ! -L "$snapshot/files/$key" ] && [ ! -L "$snapshot/absent/$key" ] && [ ! -L "$snapshot/hashes/$key" ] || return 1
+        if [ -f "$snapshot/files/$key" ]; then
+            [ ! -e "$snapshot/absent/$key" ] && [ -f "$snapshot/hashes/$key" ] || return 1
+            want=$(cat "$snapshot/hashes/$key")
+            got=$(_sha256_file "$snapshot/files/$key") || return 1
+            [ "$got" = "$want" ] || return 1
+        else
+            [ -f "$snapshot/absent/$key" ] && [ ! -e "$snapshot/files/$key" ] || return 1
+        fi
+    done < "$snapshot/targets"
+}
+
+# Stage the complete set before any replacement. The caller defers signals
+# across this whole operation and restores a rescue snapshot if a commit fails.
+_restore_upgrade_files() {
+    local snapshot="$1" key target mode result=0
+    while IFS='|' read -r key target mode; do
+        if [ -f "$snapshot/files/$key" ]; then
+            mkdir -p "$(dirname "$target")" || { result=1; break; }
+            _new_private_tmp "$target.restore.$$" && \
+                cp -p "$snapshot/files/$key" "$target.restore.$$" && \
+                chmod "$mode" "$target.restore.$$" || { result=1; break; }
+        fi
+    done < "$snapshot/targets"
+    if [ "$result" = 0 ]; then
+        while IFS='|' read -r key target mode; do
+            if [ -f "$snapshot/files/$key" ]; then
+                mv -f "$target.restore.$$" "$target" || { result=1; break; }
+            else
+                rm -f "$target" || { result=1; break; }
+            fi
+        done < "$snapshot/targets"
+    fi
+    while IFS='|' read -r key target mode; do rm -f "$target.restore.$$"; done < "$snapshot/targets"
+    return "$result"
+}
+
+_start_snapshot_services() {
+    _UPGRADE_CORE_RUNNING=$(cat "$1/core.running")
+    _UPGRADE_WEB_RUNNING=$(cat "$1/web.running")
+    if [ "$INIT_SYS" = systemd ]; then systemctl daemon-reload || return 1; fi
+    _resume_upgrade_services
+}
+
+do_rollback() {
+    local snapshot="${1:-}" rescue db
+    # Accept what a shell hands over: a tab-completed trailing slash or a path
+    # relative to the current directory.
+    while :; do case "$snapshot" in ?*/) snapshot=${snapshot%/} ;; *) break ;; esac; done
+    while :; do case "$snapshot" in ./*) snapshot=${snapshot#./} ;; *) break ;; esac; done
+    case "$snapshot" in ''|/*) ;; *) snapshot="$(pwd)/$snapshot" ;; esac
+    if [ ! -d "$snapshot" ]; then
+        msg_err "$(t "Snapshot directory not found: ${snapshot:-<empty>}" "未找到快照目录：${snapshot:-<空>}")"
+        return 1
+    fi
+    if ! _validate_upgrade_snapshot "$snapshot"; then
+        msg_err "$(t "Invalid or damaged upgrade snapshot; nothing restored" "升级快照无效或损坏；未执行恢复")"
+        return 1
+    fi
+    # Reconfiguration can move the DB. Refuse to mix snapshots with a different
+    # deployment rather than overwrite an unrelated database.
+    db=$(_web_db_path) || {
+        msg_err "$(t "Cannot determine the current Web database path from ${ET_WEB_ARGS_FILE}; nothing restored" "无法从 ${ET_WEB_ARGS_FILE} 确定当前 Web 数据库路径；未执行恢复")"; return 1; }
+    [ "$db" = "$(cat "$snapshot/database.path")" ] || {
+        msg_err "$(t "Database path differs from this snapshot; restore the matching deployment" "数据库路径与快照不同；请在对应的部署中恢复")"; return 1; }
+    _stop_upgrade_services db || return 1
+    if ! _create_upgrade_snapshot "$db"; then _resume_upgrade_services || true; return 1; fi
+    rescue="$UPGRADE_SNAPSHOT"
+    crit_begin
+    if _restore_upgrade_files "$snapshot" && _start_snapshot_services "$snapshot"; then
+        crit_end
+        msg_ok "$(t "Binaries, database and configuration restored together" "程序、数据库和配置已成套恢复")"
+        msg_info "$(t "Pre-rollback rescue snapshot: $rescue" "回退前的恢复快照：$rescue")"
+        return 0
+    fi
+    # A failed start may already have opened SQLite. Stop it before restoring
+    # the rescue snapshot; never overwrite a database still being used, and
+    # never restart anything on top of a half-restored file set.
+    if _halt_upgrade_services && _restore_upgrade_files "$rescue" && _start_snapshot_services "$rescue"; then
+        msg_warn "$(t "Rollback failed; restored the pre-rollback state" "回退失败；已恢复回退前的状态")"
+    else
+        msg_err "$(t "Recovery incomplete; keep services stopped and recover from $rescue" "恢复未完成；请保持服务停止并从 $rescue 恢复")"
+    fi
+    crit_end
+    return 1
+}
+
+_prune_upgrade_snapshots() {
+    local count=0 snapshot
+    # Names sort chronologically. Only complete manager snapshots are eligible.
+    for snapshot in "$ET_UPGRADE_BACKUP_DIR"/upgrade-*; do
+        [ -d "$snapshot" ] && [ ! -L "$snapshot" ] && [ -f "$snapshot/format" ] || continue
+        count=$((count+1))
+    done
+    for snapshot in "$ET_UPGRADE_BACKUP_DIR"/upgrade-*; do
+        [ "$count" -gt "$ET_UPGRADE_BACKUP_KEEP" ] || break
+        [ -d "$snapshot" ] && [ ! -L "$snapshot" ] && [ -f "$snapshot/format" ] || continue
+        [ "$snapshot" != "$UPGRADE_SNAPSHOT" ] || continue
+        rm -rf "$snapshot" || return 1
+        count=$((count-1))
+    done
+    # Incomplete copies left by a killed run or a power loss are never usable.
+    for snapshot in "$ET_UPGRADE_BACKUP_DIR"/.pending.*; do
+        if [ -d "$snapshot" ] && [ ! -L "$snapshot" ] && [ "$snapshot" != "$_UPGRADE_PENDING" ]; then
+            rm -rf "$snapshot" || return 1
+        fi
+    done
 }
 
 # ==============================================================================
@@ -1226,6 +1674,7 @@ _version_lookup_failed() {
 # A release tag ends up in a download URL and an API path; keep it to the shape
 # upstream actually publishes so a typo fails here instead of as a confusing 404.
 is_valid_version_tag() {
+    [ "$1" = "nightly" ] && return 0
     printf '%s' "$1" | grep -qE '^v?[0-9]+\.[0-9]+(\.[0-9]+)?([._+-][0-9A-Za-z.]+)?$'
 }
 
@@ -1237,6 +1686,7 @@ select_version() {
             return 1
         fi
         VER="$ET_VERSION"
+        case "$VER" in nightly|v*) ;; *) VER="v$VER" ;; esac
         msg_ok "$(t "Using preset version: $VER" "使用预设版本: $VER")"
         return 0
     fi
@@ -1268,7 +1718,7 @@ select_version() {
         fi
     fi
 
-    mkdir -p "$TMP_DIR"
+    [ -n "$TMP_DIR" ] && mkdir -p "$TMP_DIR" || return 1
     local rel_file="${TMP_DIR}/releases.txt"
 
     if [ -z "$json" ]; then
@@ -1277,52 +1727,10 @@ select_version() {
         _version_lookup_failed; return $?
     fi
 
-    # Parsing logic:
-    #   on tag_name  → reset and start collecting a new entry
-    #   on published_at → take the date part (YYYY-MM-DD)
-    #   on prerelease → once all three fields are set, emit a line, then reset
-    # does not depend on the field order in the JSON
-    printf '%s\n' "$json" | awk '
-        function trimstr(s,   r) {
-            r = s
-            gsub(/^[[:space:]"]+/, "", r)
-            gsub(/"[[:space:]]*,?[[:space:]]*$/, "", r)
-            gsub(/[[:space:]]+$/, "", r)
-            return r
-        }
-        {
-            if (index($0, "\"tag_name\"") > 0) {
-                # new entry starts, reset the three fields
-                if (tag != "" && date != "" && pre != "")
-                    print tag, pre, date
-                tag = ""; date = ""; pre = ""
-                val = $0
-                gsub(/.*"tag_name"[[:space:]]*:[[:space:]]*/, "", val)
-                tag = trimstr(val)
-            }
-            else if (index($0, "\"published_at\"") > 0) {
-                val = $0
-                gsub(/.*"published_at"[[:space:]]*:[[:space:]]*/, "", val)
-                val = trimstr(val)
-                gsub(/T.*$/, "", val)   # keep only YYYY-MM-DD
-                if (val == "null") val = ""   # draft releases have no date → blank it to skip the entry
-                date = val
-            }
-            else if (index($0, "\"prerelease\"") > 0) {
-                pre = (index($0, "true") > 0) ? "pre" : "stable"
-                # prerelease is usually one of the last fields, try emitting here
-                if (tag != "" && date != "" && pre != "") {
-                    print tag, pre, date
-                    tag = ""; date = ""; pre = ""
-                }
-            }
-        }
-        END {
-            # emit the last entry (if not already flushed by a tag_name reset)
-            if (tag != "" && date != "" && pre != "")
-                print tag, pre, date
-        }
-    ' > "$rel_file"
+    if ! printf '%s\n' "$json" | _release_rows > "$rel_file"; then
+        msg_err "$(t "Invalid release metadata" "发行版本信息无效")"
+        return 1
+    fi
 
     local count
     count=$(wc -l < "$rel_file" | tr -d ' \t')
@@ -1336,7 +1744,7 @@ select_version() {
     # an explicit ET_VERSION or ET_ALLOW_PRERELEASE=1.
     if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
         if [ "$ET_ALLOW_PRERELEASE" = "1" ]; then
-            VER=$(sed -n '1p' "$rel_file" | awk '{print $1}')
+            VER=$(awk '$2 != "nightly" { print $1; exit }' "$rel_file")
         else
             VER=$(awk '$2 == "stable" { print $1; exit }' "$rel_file")
         fi
@@ -1348,6 +1756,13 @@ select_version() {
         return 0
     fi
 
+    local default_choice
+    if [ "$ET_ALLOW_PRERELEASE" = "1" ]; then
+        default_choice=$(awk '$2 != "nightly" { print NR; exit }' "$rel_file")
+    else
+        default_choice=$(awk '$2 == "stable" { print NR; exit }' "$rel_file")
+    fi
+    default_choice=${default_choice:-0}
     while true; do
         # header (all ASCII, strictly aligned with the %-16s %-14s columns of the data rows below)
         printf "  ${C_BLD}%4s  %-16s  %-14s  %s${C_RST}\n" \
@@ -1361,6 +1776,8 @@ select_version() {
             i=$((i + 1))
             if [ "$pre" = "stable" ]; then
                 label="[stable]    "; clr="$C_GRN"
+            elif [ "$pre" = "nightly" ]; then
+                label="[nightly]"; clr="$C_YLW"
             else
                 label="[pre-release]"; clr="$C_YLW"
             fi
@@ -1371,11 +1788,10 @@ select_version() {
         printf "  ${C_BLD}%3s)${C_RST}  $(t "Back" "返回")\n" "0"
         printf "  %s\n" \
             "────────────────────────────────────────────────────"
-        printf "$(t "  Select [0-%d, default 1]: " "  选择 [0-%d，默认 1]: ")" "$count"
-        read -r vc
-
+        printf "$(t "  Select [0-%d, default %s]: " "  选择 [0-%d，默认 %s]: ")" "$count" "$default_choice"
+        read -r vc || return 1
+        [ -n "$vc" ] || vc="$default_choice"
         [ "$vc" = "0" ] && return 1
-        [ -z "$vc"  ] && vc=1
 
         local valid=false
         printf '%s' "$vc" | grep -qE '^[0-9]+$' && \
@@ -1403,17 +1819,27 @@ do_download() {
     [ "$arch" = "unknown" ] && \
         die "$(t "Unrecognized arch $(uname -m); download manually from https://github.com/EasyTier/EasyTier/releases" "无法识别架构 $(uname -m)，请访问 https://github.com/EasyTier/EasyTier/releases 手动下载")"
 
-    local zip_name="easytier-linux-${arch}-${ver}.zip"
-    local url="https://github.com/EasyTier/EasyTier/releases/download/${ver}/${zip_name}"
+    EXTRACT_DIR=""
+    local resolve_rc=0
+    _resolve_release_asset "$ver" "$arch" || resolve_rc=$?
+    if [ "$resolve_rc" = 2 ]; then
+        msg_err "$(t "GitHub API unreachable; ${ver} cannot be resolved without official metadata (set ET_GITHUB_TOKEN if rate-limited)" "无法访问 GitHub API；${ver} 必须依赖官方元数据才能解析（若被限流请设置 ET_GITHUB_TOKEN）")"
+        return 1
+    elif [ "$resolve_rc" != 0 ]; then
+        msg_err "$(t "No matching official release asset for ${ver} / ${arch}" "未找到 ${ver} / ${arch} 对应的官方发行包")"
+        return 1
+    fi
+    local zip_name="$ASSET_NAME"
+    local url="$ASSET_URL"
     local zip_path="${TMP_DIR}/${zip_name}"
 
     section "$(t "Download EasyTier" "下载 EasyTier")"
     msg_info "$(t "Version: ${ver}  Arch: ${arch}" "版本: ${ver}  架构: ${arch}")"
 
-    # /tmp must hold at least the zip (~30MB) + extracted contents (~80MB)
-    _check_space "/tmp" "$ET_MIN_TMP_MB" "$(t "/tmp (download + extract)" "/tmp (下载 + 解压)")" || return 1
+    [ -n "$TMP_DIR" ] && mkdir -p "$TMP_DIR" || return 1
+    # the work dir must hold at least the zip (~30MB) + extracted contents (~80MB)
+    _check_space "$TMP_DIR" "$ET_MIN_TMP_MB" "$(t "${TMP_DIR} (download + extract)" "${TMP_DIR} (下载 + 解压)")" || return 1
 
-    mkdir -p "$TMP_DIR"
     # Walk the candidate sources until one yields something that is actually a zip.
     # --speed-limit/--speed-time abandon a stalled or crawling transfer instead of
     # waiting out the full timeout, which is the whole point of having fallbacks.
@@ -1445,10 +1871,7 @@ EOF
 
     # Integrity is mandatory by default. A caller-provided digest has priority;
     # otherwise fetch the digest from the official GitHub release API.
-    local expected_sha="${ET_SHA256:-}"
-    if [ -z "$expected_sha" ]; then
-        expected_sha=$(_release_sha256 "$ver" "$zip_name") || true
-    fi
+    local expected_sha="${ET_SHA256:-$ASSET_SHA256}"
     if [ -z "$expected_sha" ]; then
         if [ "$ET_ALLOW_UNVERIFIED" = "1" ]; then
             msg_warn "$(t "Official SHA256 unavailable; proceeding because ET_ALLOW_UNVERIFIED=1" "无法取得官方 SHA256；因 ET_ALLOW_UNVERIFIED=1 继续")"
@@ -1462,7 +1885,9 @@ EOF
     fi
 
     msg_info "$(t "Extracting..." "解压中...")"
-    if ! unzip -o "$zip_path" -d "${TMP_DIR}/"; then
+    local extract_root
+    extract_root=$(mktemp -d "${TMP_DIR}/extract.XXXXXX") || return 1
+    if ! unzip -o "$zip_path" -d "$extract_root/"; then
         msg_err "$(t "Extraction failed" "解压失败")"
         case "$OS_TYPE" in
             openwrt) msg_info "$(t "First run: opkg install unzip" "请先: opkg install unzip")" ;;
@@ -1475,7 +1900,7 @@ EOF
     fi
 
     local core_path
-    core_path=$(find "$TMP_DIR" -maxdepth 2 -name "easytier-core" -type f 2>/dev/null | head -1)
+    core_path=$(find "$extract_root" -maxdepth 2 -name "easytier-core" -type f 2>/dev/null | head -1)
     [ -z "$core_path" ] && { msg_err "$(t "easytier-core not found after extraction (is the version correct?)" "解压后未找到 easytier-core（版本号是否正确？）")"; return 1; }
 
     EXTRACT_DIR=$(dirname "$core_path")
@@ -1489,17 +1914,19 @@ EOF
 do_install_bins() {
     local extract_dir="$1"
     local ts; ts=$(date +%s)
-    local installed=0 staged="" committed="" rollback_dir="${TMP_DIR}/rollback"
+    UPGRADE_SNAPSHOT=""
+    local installed=0 committed="" rollback_dir=""
 
     # by default install only core+cli (node essentials); others added on demand / if previously installed
     # — easytier-web GUI only when ET_INSTALL_WEB_GUI=1
     # — already-deployed extra binaries always upgrade too, avoiding web-embed version skew after a core upgrade
     local install_list="easytier-core easytier-cli"
     [ "$ET_INSTALL_WEB_GUI" = "1" ] && install_list="$install_list easytier-web"
+    [ ! -f "$ET_WEB_ARGS_FILE" ] || install_list="$install_list easytier-web-embed"
     for _bin in easytier-web easytier-web-embed; do
         case " $install_list " in
             *" $_bin "*) ;;
-            *) [ -f "/usr/bin/$_bin" ] && install_list="$install_list $_bin" ;;
+            *) [ -f "${BIN_DIR}/$_bin" ] && install_list="$install_list $_bin" ;;
         esac
     done
 
@@ -1507,7 +1934,7 @@ do_install_bins() {
     KEEP_BACKUP=0
     local has_existing=0
     for bin in $ET_ALL_BINS; do
-        [ -f "/usr/bin/$bin" ] && { has_existing=1; break; }
+        [ -f "${BIN_DIR}/$bin" ] && { has_existing=1; break; }
     done
     if [ "$has_existing" = "1" ]; then
         if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
@@ -1537,44 +1964,44 @@ do_install_bins() {
     done
     [ "$need_mb" -gt 0 ] && { _check_space "/usr/bin" "$need_mb" "/usr/bin" || return 1; }
 
-    section "$(t "Installing binaries → /usr/bin/" "安装二进制文件 → /usr/bin/")"
+    section "$(t "Installing binaries → ${BIN_DIR}/" "安装二进制文件 → ${BIN_DIR}/")"
 
     # Stage and validate every binary before stopping a working service. All
     # staged files live on the target filesystem so the final renames are atomic.
     for bin in $install_list; do
-        local _new="/usr/bin/${bin}.tmp.$$"
+        local _new="${BIN_DIR}/${bin}.tmp.$$"
         if ! cp "${extract_dir}/${bin}" "$_new" || ! chmod +x "$_new"; then
-            rm -f /usr/bin/*.tmp.$$ 2>/dev/null || true
+            rm -f "${BIN_DIR}"/*.tmp.$$ 2>/dev/null || true
             msg_err "$(t "Failed to stage ${bin}; existing installation was not changed" "暂存 ${bin} 失败；现有安装未被修改")"
             return 1
         fi
-        staged="${staged}${staged:+ }${bin}"
     done
 
-    local staged_core="/usr/bin/easytier-core.tmp.$$" staged_ver="" wanted_ver="${VER#v}"
-    staged_ver=$("$staged_core" --version 2>/dev/null | awk '{print $2}' | cut -d- -f1) || true
-    if [ -z "$staged_ver" ] || { [ -n "$wanted_ver" ] && [ "$staged_ver" != "$wanted_ver" ]; }; then
-        rm -f /usr/bin/*.tmp.$$ 2>/dev/null || true
+    local staged_core="${BIN_DIR}/easytier-core.tmp.$$" staged_ver="" wanted_ver="${DOWNLOAD_VERSION:-${VER#v}}"
+    staged_ver=$("$staged_core" --version 2>/dev/null | awk '{print $2}') || true
+    if ! _version_matches "$staged_ver" "$wanted_ver"; then
+        rm -f "${BIN_DIR}"/*.tmp.$$ 2>/dev/null || true
         msg_err "$(t "Staged easytier-core version mismatch (wanted ${wanted_ver:-?}, got ${staged_ver:-unusable})" "暂存的 easytier-core 版本不匹配（期望 ${wanted_ver:-?}，实际 ${staged_ver:-不可执行}）")"
         return 1
     fi
 
     # Prepare rollback copies before any target is changed. These are temporary
     # and independent of the user's persistent-backup preference.
-    if ! mkdir -p "$rollback_dir"; then
-        rm -f /usr/bin/*.tmp.$$ 2>/dev/null || true
+    mkdir -p "$TMP_DIR" || return 1
+    if ! rollback_dir=$(mktemp -d "$TMP_DIR/rollback.XXXXXX"); then
+        rm -f "${BIN_DIR}"/*.tmp.$$ 2>/dev/null || true
         return 1
     fi
     for bin in $install_list; do
-        if [ -f "/usr/bin/$bin" ]; then
-            if ! cp -p "/usr/bin/$bin" "$rollback_dir/$bin"; then
-                rm -f /usr/bin/*.tmp.$$ 2>/dev/null || true
+        if [ -f "${BIN_DIR}/$bin" ]; then
+            if ! cp -p "${BIN_DIR}/$bin" "$rollback_dir/$bin"; then
+                rm -f "${BIN_DIR}"/*.tmp.$$ 2>/dev/null || true
                 msg_err "$(t "Failed to prepare rollback copy for ${bin}" "无法为 ${bin} 准备回滚副本")"
                 return 1
             fi
             if [ "$KEEP_BACKUP" = "1" ] && \
-               ! cp -p "$rollback_dir/$bin" "/usr/bin/${bin}.bak.${ts}"; then
-                rm -f /usr/bin/*.tmp.$$ 2>/dev/null || true
+               ! cp -p "$rollback_dir/$bin" "${BIN_DIR}/${bin}.bak.${ts}"; then
+                rm -f "${BIN_DIR}"/*.tmp.$$ 2>/dev/null || true
                 msg_err "$(t "Failed to create requested backup for ${bin}" "无法为 ${bin} 创建请求的备份")"
                 return 1
             fi
@@ -1583,42 +2010,62 @@ do_install_bins() {
 
     # Must happen while the old binary/config/service are still present. In particular, this
     # primes EasyTier's 2.4.x -> newer built-in machine-ID migration before the first new start.
-    _prepare_machine_id_upgrade || { rm -f /usr/bin/*.tmp.$$ 2>/dev/null || true; return 1; }
+    _prepare_machine_id_upgrade || { rm -f "${BIN_DIR}"/*.tmp.$$ 2>/dev/null || true; return 1; }
 
     msg_info "$(t "Stopping running services..." "停止运行中的服务...")"
-    svc_stop; svc_stop_web
-
-    # Commit the complete set. If one rename fails, restore every target already
-    # changed in this transaction before returning failure.
-    crit_begin
-    for bin in $install_list; do
-        local _new="/usr/bin/${bin}.tmp.$$"
-        crit_ck "$_new"
-        if ! mv -f "$_new" "/usr/bin/$bin"; then
-            msg_err "$(t "Failed to commit ${bin}; rolling back this upgrade" "提交 ${bin} 失败；正在回滚本次升级")"
-            for _done in $committed; do
-                if [ -f "$rollback_dir/$_done" ]; then
-                    cp -p "$rollback_dir/$_done" "/usr/bin/${_done}.restore.$$" 2>/dev/null && \
-                        mv -f "/usr/bin/${_done}.restore.$$" "/usr/bin/$_done" 2>/dev/null || true
-                else
-                    rm -f "/usr/bin/$_done" 2>/dev/null || true
-                fi
-            done
-            rm -f /usr/bin/*.tmp.$$ 2>/dev/null || true
-            crit_end
+    local with_db=""
+    if [ -f "$ET_WEB_ARGS_FILE" ] || [ -f "$BIN_DIR/easytier-web-embed" ]; then with_db=db; fi
+    _stop_upgrade_services "$with_db" || { rm -f "${BIN_DIR}"/*.tmp.$$; return 1; }
+    if [ -n "$with_db" ]; then
+        local db_path
+        if ! db_path=$(_web_db_path) || ! _create_upgrade_snapshot "$db_path"; then
+            rm -f "${BIN_DIR}"/*.tmp.$$
+            _resume_upgrade_services || true
+            msg_err "$(t "Upgrade backup failed; existing installation was not replaced" "升级备份失败；未替换现有安装")"
             return 1
         fi
+        msg_ok "$(t "Upgrade snapshot: $UPGRADE_SNAPSHOT" "升级快照：$UPGRADE_SNAPSHOT")"
+        msg_info "$(t "Restore with: sh easytier.sh rollback $UPGRADE_SNAPSHOT" "恢复命令：sh easytier.sh rollback $UPGRADE_SNAPSHOT")"
+    fi
+
+    # Defer signals until the entire set passes final validation or is restored.
+    local commit_ok=1 recovery_ok=1
+    crit_begin
+    for bin in $install_list; do
+        local _new="${BIN_DIR}/${bin}.tmp.$$"
+        if ! mv -f "$_new" "${BIN_DIR}/$bin"; then
+            msg_err "$(t "Failed to commit ${bin}; rolling back this upgrade" "提交 ${bin} 失败；正在回滚本次升级")"
+            commit_ok=0
+            break
+        fi
         committed="${committed}${committed:+ }${bin}"
-        local size; size=$(du -sh "/usr/bin/${bin}" 2>/dev/null | awk '{print $1}')
+        local size; size=$(du -sh "${BIN_DIR}/${bin}" 2>/dev/null | awk '{print $1}')
         printf "  ${C_GRN}✓${C_RST}  %-30s  %s\n" "$bin" "$size"
         installed=$((installed + 1))
     done
-    crit_end
-
-    if [ "$installed" -eq 0 ] || ! /usr/bin/easytier-core --version > /dev/null 2>&1; then
-        msg_err "$(t "Installed easytier-core failed final validation" "安装后的 easytier-core 最终验证失败")"
+    if [ "$commit_ok" = 1 ] && { [ "$installed" -eq 0 ] || ! _core_version_matches "$BIN_DIR/easytier-core" "$wanted_ver"; }; then
+        msg_err "$(t "Installed easytier-core failed final validation; restoring old binaries" "安装后的 easytier-core 最终验证失败；正在恢复旧程序")"
+        commit_ok=0
+    fi
+    if [ "$commit_ok" = 0 ]; then
+        for _done in $committed; do
+            if [ -f "$rollback_dir/$_done" ]; then
+                cp -p "$rollback_dir/$_done" "${BIN_DIR}/${_done}.restore.$$" 2>/dev/null && \
+                    mv -f "${BIN_DIR}/${_done}.restore.$$" "${BIN_DIR}/$_done" 2>/dev/null || recovery_ok=0
+            else
+                rm -f "${BIN_DIR}/$_done" 2>/dev/null || recovery_ok=0
+            fi
+        done
+        rm -f "${BIN_DIR}"/*.tmp.$$ 2>/dev/null || true
+        if [ "$recovery_ok" = 1 ]; then
+            _resume_upgrade_services || msg_err "$(t "Old services could not restart" "旧版服务未能重新启动")"
+        else
+            msg_err "$(t "Binary recovery failed; services remain stopped. Snapshot: ${UPGRADE_SNAPSHOT:-none}" "二进制恢复失败；服务保持停止。快照：${UPGRADE_SNAPSHOT:-无}")"
+        fi
+        crit_end
         return 1
     fi
+    crit_end
 
     for bin in $ET_ALL_BINS; do
         case " $install_list " in
@@ -1628,7 +2075,7 @@ do_install_bins() {
     done
 
     printf "\n"
-    msg_ok "$(t "Installed: $(/usr/bin/easytier-core --version)" "安装完成: $(/usr/bin/easytier-core --version)")"
+    msg_ok "$(t "Installed: $("${BIN_DIR}/easytier-core" --version)" "安装完成: $("${BIN_DIR}/easytier-core" --version)")"
     # _prune_backups always runs: even without a new backup it trims old ones down to ET_BACKUP_KEEP
     _prune_backups
     return 0
@@ -2053,7 +2500,10 @@ _toml_wizard() {
     _TOML_PRIVATE=$(_bool_value "$ET_PRIVATE_MODE")
     _TOML_EXITNODE=$(_bool_value "$ET_ENABLE_EXIT_NODE")
     _TOML_USE_SMOLTCP=$(_bool_value "$ET_USE_SMOLTCP")
-    case "$ET_DATA_COMPRESS_ALGO" in 0|1|2) _TOML_COMPRESS="$ET_DATA_COMPRESS_ALGO" ;; *) _TOML_COMPRESS=0 ;; esac
+    case "$ET_DATA_COMPRESS_ALGO" in
+        0|1|2|3) _TOML_COMPRESS="$ET_DATA_COMPRESS_ALGO" ;;
+        *) msg_err "$(t "Invalid compression algorithm" "压缩算法无效")"; return 1 ;;
+    esac
     if [ "${ET_NONINTERACTIVE:-0}" != "1" ]; then
         if _ask_flag "$(t "  Configure advanced options (device name, encryption…)? [y/N]: " "  配置高级选项（设备名、加密…）? [y/N]: ")" n; then
             _read_text "$(printf "$(t "  TUN device name [default %s]: " "  TUN 设备名 [默认 %s]: ")" "$_TOML_DEV_NAME")"
@@ -2077,7 +2527,7 @@ _validate_core_config() {
         return 1
     }
     if "$ET_CORE_BIN_FILE" --help 2>/dev/null | grep -q -- '--check-config'; then
-        if "$ET_CORE_BIN_FILE" --config-file "$_cfg" --check-config; then
+        if _without_et_env "$ET_CORE_BIN_FILE" --config-file "$_cfg" --check-config; then
             msg_ok "$(t "EasyTier config validation passed" "EasyTier 配置验证通过")"
             return 0
         fi
@@ -2088,7 +2538,15 @@ _validate_core_config() {
     return 0
 }
 
+_core_supports_lzo() {
+    "$1" --help 2>/dev/null | grep -qiE '(^|[^[:alnum:]_])lzo([^[:alnum:]_]|$)'
+}
+
 _toml_write_config() {
+    if [ "$_TOML_COMPRESS" = 3 ] && ! _core_supports_lzo "$ET_CORE_BIN_FILE"; then
+        msg_err "$(t "This core build does not advertise LZO support; choose none/Zstd or upgrade it" "当前 core 构建未声明支持 LZO；请选择关闭压缩/Zstd 或升级 core")"
+        return 1
+    fi
     local cfg="$ET_CORE_CONFIG_FILE"
     local _tmp="${cfg}.tmp.$$"
     local p="$_TOML_LISTEN_PORT" p1 p2
@@ -2301,7 +2759,7 @@ setup_web_console() {
     # Older units used the upstream relative default and therefore commonly
     # stored the database at /et.db. Migrate it once while the service is stopped.
     if [ ! -e "$ET_WEB_DB_PATH" ] && [ -f /et.db ] && \
-       { [ ! -f /etc/easytier/web.args ] || ! grep -q '^--db$' /etc/easytier/web.args; }; then
+       { [ ! -f "${ET_WEB_ARGS_FILE}" ] || ! grep -q '^--db$' "${ET_WEB_ARGS_FILE}"; }; then
         svc_stop_web 2>/dev/null || true
         if ! mv /et.db "$ET_WEB_DB_PATH"; then
             msg_err "$(t "Failed to migrate legacy /et.db" "迁移旧版 /et.db 失败")"
@@ -2312,7 +2770,7 @@ setup_web_console() {
         msg_ok "$(t "Migrated legacy Web database to ${ET_WEB_DB_PATH}" "已将旧版 Web 数据库迁移到 ${ET_WEB_DB_PATH}")"
     fi
 
-    local _tmp="/etc/easytier/web.args.tmp.$$"
+    local _tmp="${ET_WEB_ARGS_FILE}.tmp.$$"
     _new_private_tmp "$_tmp" || return 1
     crit_begin
     if ! printf '%s\n' \
@@ -2327,7 +2785,7 @@ setup_web_console() {
         crit_end
         return 1
     fi
-    if ! _commit_tmp "$_tmp" /etc/easytier/web.args 600; then
+    if ! _commit_tmp "$_tmp" "${ET_WEB_ARGS_FILE}" 600; then
         crit_end
         return 1
     fi
@@ -2383,7 +2841,7 @@ ask_core_web_url() {
                 if [ "$started_web" = "true" ]; then
                     msg_info "$(t "Undoing web-embed configuration..." "正在撤销 web-embed 配置...")"
                     svc_stop_web; svc_remove_web
-                    rm -f /etc/easytier/web.args
+                    rm -f "${ET_WEB_ARGS_FILE}"
                     msg_ok "$(t "web-embed service undone" "已撤销 web-embed 服务")"
                 fi
                 return 1
@@ -2491,7 +2949,7 @@ do_view_status() {
     }
 
     _print_svc_block "easytier-core"      "easytier-core"      "$ET_CORE_ARGS_FILE"
-    _print_svc_block "easytier-web-embed" "easytier-web-embed" "/etc/easytier/web.args"
+    _print_svc_block "easytier-web-embed" "easytier-web-embed" "${ET_WEB_ARGS_FILE}"
 
     # ── Network overview via easytier-cli (peers / routes) — best-effort ──
     if [ -x /usr/bin/easytier-cli ] && _proc_running "easytier-core"; then
@@ -2540,15 +2998,15 @@ do_manage_web() {
 
         if _proc_running "easytier-web-embed"; then
             local port=""
-            [ -f /etc/easytier/web.args ] && \
-                port=$(grep -A1 '^--api-server-port$' /etc/easytier/web.args 2>/dev/null \
+            [ -f "${ET_WEB_ARGS_FILE}" ] && \
+                port=$(grep -A1 '^--api-server-port$' "${ET_WEB_ARGS_FILE}" 2>/dev/null \
                        | tail -1 | tr -d ' \t')
             printf "  $(t "Status" "状态"): ${C_GRN}$(t "✓ running" "✓ 运行中")${C_RST}${port:+  ($(t "port" "端口") ${port})}\n"
         else
             printf "  $(t "Status" "状态"): ${C_RED}$(t "✗ stopped" "✗ 未运行")${C_RST}\n"
         fi
-        [ -f /etc/easytier/web.args ] && \
-            printf "  $(t "Args" "参数"): ${C_DIM}%s${C_RST}\n" "$(tr '\n' ' ' < /etc/easytier/web.args)"
+        [ -f "${ET_WEB_ARGS_FILE}" ] && \
+            printf "  $(t "Args" "参数"): ${C_DIM}%s${C_RST}\n" "$(tr '\n' ' ' < "${ET_WEB_ARGS_FILE}")"
 
         printf '\n'
         printf "  ${C_BLD}1)${C_RST}  $(t "Start / restart" "启动 / 重启")\n"
@@ -2562,16 +3020,16 @@ do_manage_web() {
         case "$wc" in
             0) return 0 ;;
             1)
-                if [ ! -f /etc/easytier/web.args ]; then
+                if [ ! -f "${ET_WEB_ARGS_FILE}" ]; then
                     msg_warn "$(t "web.args not found; run 'Reconfigure (3)' first" "未找到 web.args，请先执行「重新配置（3）」")"
                     continue
                 fi
                 svc_stop_web 2>/dev/null || true
                 svc_start_web || { msg_err "$(t "Failed to start easytier-web" "easytier-web 启动失败")"; continue; }
                 local p="" pa=""
-                p=$(grep -A1 '^--api-server-port$' /etc/easytier/web.args 2>/dev/null \
+                p=$(grep -A1 '^--api-server-port$' "${ET_WEB_ARGS_FILE}" 2>/dev/null \
                     | tail -1 | tr -d ' \t')
-                pa=$(grep -A1 '^--api-server-addr$' /etc/easytier/web.args 2>/dev/null \
+                pa=$(grep -A1 '^--api-server-addr$' "${ET_WEB_ARGS_FILE}" 2>/dev/null \
                     | tail -1 | tr -d ' \t')
                 case "$p"  in --*) p="" ;; esac
                 case "$pa" in --*) pa="" ;; esac
@@ -2586,7 +3044,7 @@ do_manage_web() {
                 case "$a" in
                     y|Y)
                         svc_stop_web; svc_remove_web
-                        rm -f /etc/easytier/web.args
+                        rm -f "${ET_WEB_ARGS_FILE}"
                         msg_ok "$(t "Removed" "已移除")"
                         ;;
                     *) msg_info "$(t "Cancelled" "已取消")" ;;
@@ -2682,7 +3140,7 @@ show_file_locations() {
     # prints the one command that matches whatever it found wrong.
     printf "  $(t "Follow the runtime log" "实时查看运行日志"):\n"
     _cmd_hint "$(_svc_log_cmd easytier-core follow)" "easytier-core"
-    [ -f /etc/easytier/web.args ] && \
+    [ -f "${ET_WEB_ARGS_FILE}" ] && \
         _cmd_hint "$(_svc_log_cmd easytier-web-embed follow)" "easytier-web"
     _cmd_hint "tail -f ${LOG_FILE}" "$(t "manager log" "脚本自身日志")"
 
@@ -2913,11 +3371,11 @@ _print_header() {
 
     if _proc_running "easytier-web-embed"; then
         local port=""
-        [ -f /etc/easytier/web.args ] && \
-            port=$(grep -A1 '^--api-server-port$' /etc/easytier/web.args 2>/dev/null \
+        [ -f "${ET_WEB_ARGS_FILE}" ] && \
+            port=$(grep -A1 '^--api-server-port$' "${ET_WEB_ARGS_FILE}" 2>/dev/null \
                    | tail -1 | tr -d ' ')
         web_str="${C_GRN}$(t "✓ running" "✓ 运行中")${C_RST}${port:+  ($(t "port" "端口") ${port})}"
-    elif [ -f /etc/easytier/web.args ]; then
+    elif [ -f "${ET_WEB_ARGS_FILE}" ]; then
         web_str="${C_YLW}$(t "✗ configured but not running" "✗ 已配置但未运行")${C_RST}"
     fi
 
@@ -2954,6 +3412,7 @@ $(t "Commands" "命令"):
   start|stop|restart
                     $(t "control easytier-core (and web-embed if configured)" "控制 easytier-core（及已配置的 web-embed）")
   version           $(t "print script and core version" "打印脚本与 core 版本")
+  rollback <path>   $(t "restore an upgrade snapshot (programs, DB and config)" "恢复升级快照（程序、数据库及配置）")
   help              $(t "this help" "本帮助")
 
 $(t "Non-interactive install: set ET_NONINTERACTIVE=1 and ET_* vars (see README)." "非交互安装：设置 ET_NONINTERACTIVE=1 及 ET_* 变量（见 README）。")
@@ -2972,6 +3431,7 @@ main() {
         [ -z "$_u_backup" ] && ET_BACKUP_KEEP=1
         [ -z "$_u_lsize"  ] && ET_FILE_LOG_SIZE=2
         [ -z "$_u_lcount" ] && ET_FILE_LOG_COUNT=3
+        [ -z "$_u_upkeep" ] && ET_UPGRADE_BACKUP_KEEP=1
     fi
 
     # ── One-shot subcommands (for scripts / cron); these don't need curl/unzip ──
@@ -2985,21 +3445,24 @@ main() {
             exit 0 ;;
         status)
             do_view_status; exit $? ;;
+        rollback)
+            [ "$#" -eq 2 ] || { _usage; exit 2; }
+            do_rollback "$2"; exit $? ;;
         start)
             svc_start || exit 1
             check_proc easytier-core "easytier-core" || exit 1
-            if [ -f /etc/easytier/web.args ]; then
+            if [ -f "${ET_WEB_ARGS_FILE}" ]; then
                 svc_start_web || exit 1
                 check_proc easytier-web-embed "easytier-web-embed" || exit 1
             fi
             exit 0 ;;
         stop)
-            svc_stop; [ -f /etc/easytier/web.args ] && svc_stop_web
+            svc_stop; [ -f "${ET_WEB_ARGS_FILE}" ] && svc_stop_web
             msg_ok "$(t "Stopped" "已停止")"; exit 0 ;;
         restart)
             svc_restart || exit 1
             check_proc easytier-core "easytier-core" || exit 1
-            if [ -f /etc/easytier/web.args ]; then
+            if [ -f "${ET_WEB_ARGS_FILE}" ]; then
                 svc_restart_web || exit 1
                 check_proc easytier-web-embed "easytier-web-embed" || exit 1
             fi
@@ -3010,6 +3473,7 @@ main() {
             _usage; exit 2 ;;
     esac
 
+    TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/et_mgr.XXXXXX") || return 1
     check_deps
 
     _log "INFO" "Script start v${SCRIPT_VERSION} OS=${OS_TYPE} INIT=${INIT_SYS} ARCH=${ARCH_NAME} BACKUP=${ET_BACKUP_KEEP} LOG=${ET_FILE_LOG_SIZE}MB×${ET_FILE_LOG_COUNT}"
@@ -3019,19 +3483,19 @@ main() {
     if [ "${ET_NONINTERACTIVE:-0}" = "1" ]; then
         select_version                   || die "$(t "Version selection failed" "版本选择失败")"
         do_download "$VER" "$ARCH_NAME"  || die "$(t "Download failed" "下载失败")"
+        # do_install_bins also upgrades a deployed web-embed in the same transaction
         do_install_bins "$EXTRACT_DIR"   || die "$(t "Install failed" "安装失败")"
-        # if web-embed was deployed, upgrade it too to avoid version skew with core
-        [ ! -f /etc/easytier/web.args ] || _install_extra_bin easytier-web-embed || die "$(t "Web binary upgrade failed" "Web 二进制升级失败")"
         do_setup_mode                    || die "$(t "Configuration failed (check ET_MODE / ET_VIRTUAL_IP / ET_WEB_URL, etc.)" "配置失败（检查 ET_MODE / ET_VIRTUAL_IP / ET_WEB_URL 等）")"
         svc_write_core                   || die "$(t "Service file write failed" "服务文件写入失败")"
         svc_stop 2>/dev/null || true
         svc_start                        || die "$(t "Service start failed" "服务启动失败")"
         check_proc easytier-core "easytier-core" || die "$(t "easytier-core did not stay running" "easytier-core 未保持运行")"
-        if [ -f /etc/easytier/web.args ]; then
+        if [ -f "${ET_WEB_ARGS_FILE}" ]; then
             svc_write_web                || die "$(t "Web service file write failed" "Web 服务文件写入失败")"
             svc_restart_web              || die "$(t "Web service restart failed" "Web 服务重启失败")"
             check_proc easytier-web-embed "easytier-web-embed" || die "$(t "easytier-web-embed did not stay running" "easytier-web-embed 未保持运行")"
         fi
+        [ -z "$UPGRADE_SNAPSHOT" ] || _prune_upgrade_snapshots
         _log "INFO" "Non-interactive install complete VER=${VER}"
         exit 0
     fi
@@ -3121,7 +3585,7 @@ main() {
                 msg_info "$(t "Restarting easytier-core..." "重启 easytier-core...")"
                 svc_restart || { msg_err "$(t "Restart failed" "重启失败")"; continue; }
                 check_proc easytier-core "easytier-core" || continue
-                if [ -f /etc/easytier/web.args ]; then
+                if [ -f "${ET_WEB_ARGS_FILE}" ]; then
                     printf '%s' "$(t "  Also restart easytier-web-embed? [Y/n]: " "  同时重启 easytier-web-embed? [Y/n]: ")"
                     read -r a
                     case "$a" in
@@ -3185,20 +3649,20 @@ main() {
                     0) continue ;;
                     1)
                         do_download "$VER" "$ARCH_NAME"  || continue
+                        # a deployed web-embed is upgraded inside the same transaction
                         do_install_bins "$EXTRACT_DIR"   || continue
-                        # web.args present means web-embed ran here; upgrade it on demand too
-                        [ ! -f /etc/easytier/web.args ] || _install_extra_bin easytier-web-embed || continue
                         # rewrite service files (systemd ExecStart embeds the path, needs updating)
                         if [ -f /etc/easytier/core.args ]; then
                             svc_write_core || { msg_err "$(t "Service file write failed" "服务文件写入失败")"; continue; }
                         fi
                         svc_start || { msg_err "$(t "Service start failed" "服务启动失败")"; continue; }
                         check_proc easytier-core "easytier-core" || continue
-                        if [ -f /etc/easytier/web.args ]; then
+                        if [ -f "${ET_WEB_ARGS_FILE}" ]; then
                             svc_write_web || { msg_err "$(t "Web service file write failed" "Web 服务文件写入失败")"; continue; }
                             svc_start_web || { msg_err "$(t "Web service start failed" "Web 服务启动失败")"; continue; }
                             check_proc easytier-web-embed "easytier-web-embed" || continue
                         fi
+                        [ -z "$UPGRADE_SNAPSHOT" ] || _prune_upgrade_snapshots
                         ;;
                     2)
                         do_download "$VER" "$ARCH_NAME"  || continue
@@ -3208,6 +3672,10 @@ main() {
                             svc_stop 2>/dev/null || true
                             svc_start || { msg_err "$(t "Service start failed" "服务启动失败")"; continue; }
                             check_proc easytier-core "easytier-core" || continue
+                            if [ -f "$ET_WEB_ARGS_FILE" ]; then
+                                svc_write_web && svc_start_web && check_proc easytier-web-embed easytier-web-embed || continue
+                            fi
+                            [ -z "$UPGRADE_SNAPSHOT" ] || _prune_upgrade_snapshots
                         else
                             msg_warn "$(t "Configuration skipped; binaries updated but services not restarted" "已跳过配置，二进制已更新但服务未重启")"
                         fi

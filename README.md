@@ -19,11 +19,12 @@ An interactive script to **install, configure and manage [EasyTier](https://gith
 
 - **Interactive menu** — install / update / configure / restart / uninstall / status in one place
 - **Two configuration modes** — a TOML config file or push from the Web console, both with a wizard
-- **Broad coverage** — OpenWrt(procd) / Debian / Ubuntu / RHEL / Arch(systemd) / Alpine(OpenRC); x86_64, ARM soft/hard-float, RISC-V, LoongArch, MIPS
+- **Broad coverage** — OpenWrt(procd) / Debian / Ubuntu / RHEL / Arch(systemd) / Alpine(OpenRC); x86_64, ARM soft/hard-float, RISC-V, LoongArch, MIPS, ppc64le (when the selected release provides an asset)
 - **Non-interactive mode + subcommands** — preset every parameter through environment variables (Ansible / CI); `status`/`start`/`stop`/`restart` suit cron and return a non-zero exit code on failure
 - **Mandatory integrity check** — the SHA-256 is fetched from the official Release API and enforced; mirrors, proxies and a PAT are supported for speed, but a download mirror is never trusted as the source of the digest
 - **Safe defaults** — the Web admin UI binds `127.0.0.1` only, the core control port binds loopback, exit-node and other sensitive capabilities are off; systemd units enable `NoNewPrivileges`/`ProtectSystem` sandboxing
 - **Transactional installs** — download and verify first, stage the binaries and check their version, then stop services and commit as a set, with rollback on failure; `Ctrl+C` never leaves a half-installed binary or a truncated config
+- **Web upgrade snapshots** — stop services and save the database, SQLite sidecars, matching binaries and configuration together; `rollback` restores the complete set after a schema-changing upgrade
 - **Identity preserved across upgrades** — the machine ID survives a Web-mode upgrade or reconfiguration, so the console does not mistake an existing node for a new device
 - **Small-flash friendly** — only the required binaries are installed; log and backup defaults tighten automatically under procd; disk space is checked before installing
 
@@ -45,6 +46,7 @@ sh easytier.sh status     # service status + network overview (easytier-cli peer
 sh easytier.sh start      # start / stop / restart
 sh easytier.sh version    # print the script and core versions
 sh easytier.sh help       # help
+sudo sh easytier.sh rollback /var/lib/easytier-manager/backups/upgrade-SNAPSHOT
 ```
 
 ---
@@ -112,9 +114,9 @@ Optional additions to either block — a download mirror, a pinned version, and 
 
 | Variable | Description | Default |
 |---|---|---|
-| `ET_VERSION` | Version to install; setting it explicitly allows an older or pre-release version | latest stable |
-| `ET_ARCH` | Override arch detection: `x86_64` `aarch64` `arm` `armhf` `armv7` `armv7hf` `riscv64` `loongarch64` `mips` `mipsel` | auto-detected |
-| `ET_ALLOW_PRERELEASE` | `1` = let a pre-release be selected automatically | `0` |
+| `ET_VERSION` | Version to install, e.g. `v2.6.4`, `v2.7.0` or `nightly`; explicit selection also allows older releases | latest stable |
+| `ET_ARCH` | Override arch detection: `x86_64` `aarch64` `arm` `armhf` `armv7` `armv7hf` `riscv64` `loongarch64` `mips` `mipsel` `ppc64le` | auto-detected |
+| `ET_ALLOW_PRERELEASE` | `1` = allow automatic selection of versioned pre-releases; excludes nightly | `0` |
 | `ET_ALLOW_VERSION_FALLBACK` / `ET_DEFAULT_VERSION` | Allow falling back to a fixed version when the API fails and nothing is installed | `0` / `v2.6.4` |
 | `ET_SHA256` | Set the zip's SHA-256 manually; otherwise the official digest is fetched | automatic |
 | `ET_ALLOW_UNVERIFIED` | `1` = continue when the SHA-256 cannot be fetched or computed (not recommended) | `0` |
@@ -134,7 +136,7 @@ Optional additions to either block — a download mirror, a pinned version, and 
 | `ET_ENABLE_EXIT_NODE` | `1` = let this node act as an exit node | `0` |
 | `ET_PRIVATE_MODE` | `1` = reject foreign networks | `1` |
 | `ET_USE_SMOLTCP` | `1` = use smoltcp for TCP proxying | `0` |
-| `ET_DATA_COMPRESS_ALGO` | Compression algorithm `0`/`1`/`2` | `0` (none) |
+| `ET_DATA_COMPRESS_ALGO` | Compression: `0` (legacy none), `1` (none), `2` (Zstd), `3` (LZO, requires a supporting core) | `0` (none) |
 
 ### Logging and maintenance
 
@@ -143,6 +145,8 @@ Optional additions to either block — a download mirror, a pinned version, and 
 | `ET_FILE_LOG_DIR` / `ET_FILE_LOG_LEVEL` | Core log directory / level (`off`…`trace`). Uninstall offers to `rm -rf` this directory, so it must be at least two levels deep and not a system directory | `/var/log/easytier` / `error` |
 | `ET_FILE_LOG_SIZE` / `ET_FILE_LOG_COUNT` | Size per file (MB) / files kept | `10` / `5` (procd: `2` / `3`) |
 | `ET_BACKUP_KEEP` | Backups kept per binary/config (`0` = no backup) | `3` (procd: `1`) |
+| `ET_UPGRADE_BACKUP_DIR` | Private directory for complete Web upgrade snapshots; use persistent storage on OpenWrt | `/var/lib/easytier-manager/backups` |
+| `ET_UPGRADE_BACKUP_KEEP` | Complete snapshots retained after a successful upgrade (minimum `1`); independent of `ET_BACKUP_KEEP` | `2` (`1` on OpenWrt) |
 | `ET_RELEASES_COUNT` | Maximum entries in the release list | `20` |
 | `ET_INSTALL_WEB_GUI` | `1` = also install the `easytier-web` GUI client | `0` |
 | `LOG_FILE` | Path of the script's own log | `/var/log/easytier-manager.log` |
@@ -161,10 +165,19 @@ Optional additions to either block — a download mirror, a pinned version, and 
 | `/etc/easytier/core.args` · `web.args` | Startup arguments for core / web-embed |
 | `/var/lib/easytier/machine_id` | Persistent machine ID (in the matching data directory when the service keeps `HOME`/`XDG_DATA_HOME`) |
 | `/var/lib/easytier-web/et.db` | Web console accounts and network configuration |
+| `/var/lib/easytier-manager/backups/upgrade-*` | Complete Web upgrade snapshots, including secrets; directory mode `700`, payload mode `600` |
 | `/var/log/easytier/` | Core file logs (size-rotated; on tmpfs under OpenWrt) |
 | `/var/log/easytier-manager.log` | The script's own log |
 
 ---
+
+## Upgrade channels and recovery
+
+Pressing Enter in version selection installs the latest stable release by default. `ET_ALLOW_PRERELEASE=1` also allows versioned pre-releases. Select nightly explicitly in the menu or set `ET_VERSION=nightly`. The script resolves the real archive name and SHA-256 from the same official release response; it supports dated core version strings and refuses a missing architecture asset before stopping services. LZO (`ET_DATA_COMPRESS_ALGO=3`) is rejected before replacing the configuration when the core does not advertise support.
+
+Before upgrading an existing local Web console, the script stops core/web-embed and creates a cold snapshot of all managed binaries, the database and its `-wal`/`-shm`/`-journal` files, arguments, TOML, machine ID and service definitions. A backup failure aborts the upgrade and attempts to resume previously running services. `ET_BACKUP_KEEP=0` only disables ordinary binary/config backups; it does not disable these snapshots. Reserve storage for the installed programs and database for each retained snapshot. On OpenWrt, `/var` is commonly temporary: set `ET_UPGRADE_BACKUP_DIR` to a persistent mounted directory to retain recovery data across reboots.
+
+The upgrade prints the exact snapshot and restore command. Use `sudo sh easytier.sh rollback /absolute/path/to/snapshot` to restore the matching programs and database together. Rollback first saves the current state in a rescue snapshot and restores it if the requested recovery fails. It restores the snapshot's service running states. Database writes made after the selected snapshot are no longer present in the restored database; they remain in the rescue snapshot. Recovery requires the same managed file paths and database path; custom service/database layouts need separate handling. Uninstall leaves the default upgrade snapshot directory in place. They contain credentials and should stay private.
 
 ## 🧪 Development
 
@@ -174,10 +187,17 @@ Issues and PRs are welcome. Local checks:
 shellcheck -s sh easytier.sh
 sh tests/test_machine_id.sh
 sh tests/test_manager.sh
-sh tests/test_upstream_compat.sh   # needs network; downloads the latest stable release
+sh tests/test_releases.sh
+sh tests/test_options.sh
+sh tests/test_download.sh
+sh tests/test_upgrade.sh         # test-only dependencies: python3 and sqlite3
+sh tests/test_busybox.sh         # busybox
+ET_TEST_CHANNEL=stable sh tests/test_upstream_compat.sh
+ET_TEST_CHANNEL=prerelease sh tests/test_upstream_compat.sh
+ET_TEST_CHANNEL=nightly sh tests/test_upstream_compat.sh
 ```
 
-CI runs ShellCheck and the unit tests; a weekly job verifies the upstream official digest, release layout, CLI options and the generated TOML.
+CI runs ShellCheck and the unit tests; a weekly matrix downloads stable, versioned pre-release and nightly packages to verify official digests, release layout, service arguments, generated TOML and LZO handling. Network checks execute Linux x86_64 binaries. Architecture selection tests do not replace testing on the target hardware.
 
 > ⚠️ Both languages are inlined in `t "en" "zh"` calls — **change them together**.
 
@@ -189,7 +209,7 @@ CI runs ShellCheck and the unit tests; a weekly job verifies the upstream offici
 To stay compatible with OpenWrt (BusyBox ash) and Alpine (no Bash by default), so the script also runs on routers.
 
 **Q: The download or the SHA-256 lookup fails.**
-Use `ET_GITHUB_MIRROR` for a download mirror or set `https_proxy`; set `ET_GITHUB_TOKEN` when the API is rate-limited. A mirror is never trusted as the digest source — the script still fetches the SHA-256 from the official GitHub API. You can also set the official `ET_SHA256` by hand. Use `ET_ALLOW_UNVERIFIED=1` only if you explicitly accept the risk.
+Use `ET_GITHUB_MIRROR` for a download mirror or set `https_proxy`; set `ET_GITHUB_TOKEN` when the API is rate-limited. A mirror is never trusted as the digest source — the script still fetches the SHA-256 from the official GitHub API. When the official API is unreachable, a versioned tag is still downloaded by its standard asset name, but no official digest is available, so `ET_SHA256` must be set by hand (or `ET_ALLOW_UNVERIFIED=1` accepted explicitly); `nightly` has no fixed filename and always needs the official API. Use `ET_ALLOW_UNVERIFIED=1` only if you explicitly accept the risk.
 
 **Q: Why is the Web console reachable from localhost only?**
 Upstream's initial migration seeds two accounts, `admin/admin` (superuser) and `user/user`, and registering a new account does not remove them. Prefer SSH forwarding or a reverse tunnel with TLS and access control; if you really need LAN access, set `ET_WEB_BIND_ADDR=0.0.0.0` and change both passwords immediately.

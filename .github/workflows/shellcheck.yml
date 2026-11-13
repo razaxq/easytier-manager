@@ -28,7 +28,17 @@ jobs:
           severity: warning
           format: gcc
 
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 busybox
+
       - name: Run unit tests
         run: |
           sh tests/test_machine_id.sh
           sh tests/test_manager.sh
+          sh tests/test_releases.sh
+          sh tests/test_options.sh
+          sh tests/test_download.sh
+          sh tests/test_upgrade.sh
+
+      - name: Run with BusyBox ash and utilities
+        run: sh tests/test_busybox.sh

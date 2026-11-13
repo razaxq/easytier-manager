@@ -51,14 +51,9 @@ TMP_DIR="$TEST_DIR/version"
 ET_ALLOW_PRERELEASE=0
 ET_ALLOW_VERSION_FALLBACK=0
 _gh_api() {
-    printf '%s\n' \
-        '  "tag_name": "v9.0.0-rc1",' \
-        '  "published_at": "2026-09-01T00:00:00Z",' \
-        '  "prerelease": true,' \
-        '  "tag_name": "v8.0.0",' \
-        '  "published_at": "2026-08-01T00:00:00Z",' \
-        '  "prerelease": false,'
+    printf '%s\n' '[{"tag_name":"v9.0.0-rc1","published_at":"2026-09-01T00:00:00Z","prerelease":true},{"tag_name":"v8.0.0","published_at":"2026-08-01T00:00:00Z","prerelease":false}]'
 }
+
 select_version >/dev/null || fail 'stable automatic version selection failed'
 assert_eq v8.0.0 "$VER" 'non-interactive selection skips pre-releases by default'
 
@@ -79,43 +74,6 @@ ET_ALLOW_VERSION_FALLBACK=1
 ET_DEFAULT_VERSION=v2.6.4
 select_version >/dev/null || fail 'explicit fallback opt-in failed'
 assert_eq v2.6.4 "$VER" 'fallback version requires explicit opt-in'
-
-_gh_api() {
-    printf '%s\n' \
-        '"assets": [' \
-        '  {' \
-        '    "name": "easytier-linux-x86_64-v2.6.4.zip",' \
-        '    "uploader": {"name": "release-bot"},' \
-        '    "digest": "sha256:61b659eaedba658fa66fe47d17e1426cdd77e5d02fa15fed447bb4357c09dfd6"' \
-        '  }' \
-        ']'
-}
-digest=$(_release_sha256 v2.6.4 easytier-linux-x86_64-v2.6.4.zip)
-assert_eq 61b659eaedba658fa66fe47d17e1426cdd77e5d02fa15fed447bb4357c09dfd6 "$digest" \
-    'official release asset digest is extracted by exact asset name'
-
-# An asset published before GitHub added digests must report "unavailable", never
-# borrow the digest of the asset that follows it.
-_gh_api() {
-    printf '%s\n' \
-        '"assets": [' \
-        '  {' \
-        '    "name": "easytier-linux-armv7-v2.6.4.zip",' \
-        '    "browser_download_url": "https://example.invalid/armv7.zip"' \
-        '  },' \
-        '  {' \
-        '    "name": "easytier-linux-x86_64-v2.6.4.zip",' \
-        '    "digest": "sha256:61b659eaedba658fa66fe47d17e1426cdd77e5d02fa15fed447bb4357c09dfd6",' \
-        '    "browser_download_url": "https://example.invalid/x86_64.zip"' \
-        '  }' \
-        ']'
-}
-set +e
-digest=$(_release_sha256 v2.6.4 easytier-linux-armv7-v2.6.4.zip)
-rc=$?
-set -e
-[ "$rc" -ne 0 ] && [ -z "$digest" ] || fail 'a digest-less asset borrowed another asset digest'
-pass 'a digest-less asset is reported as unavailable'
 
 is_valid_version_tag v2.6.4 || fail 'a normal release tag was rejected'
 is_valid_version_tag v2.6.4-rc1 || fail 'a pre-release tag was rejected'

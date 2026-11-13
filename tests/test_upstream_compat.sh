@@ -16,17 +16,32 @@ export ET_SOURCE_ONLY ET_LANG LOG_FILE ET_CACHE_DIR
 . "$(dirname "$0")/../easytier.sh"
 trap 'rm -rf "$TEST_DIR"' EXIT INT TERM HUP
 _init_colors
+TMP_DIR="$TEST_DIR/download"
 
 fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 pass() { printf 'ok - %s\n' "$1"; }
 
-release_json=$(_gh_api 'https://api.github.com/repos/EasyTier/EasyTier/releases/latest') || \
-    fail 'could not query the latest stable EasyTier release'
-tag=$(printf '%s\n' "$release_json" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-[ -n "$tag" ] || fail 'latest stable release did not contain a tag'
-pass "latest stable release resolved to $tag"
+channel="${ET_TEST_CHANNEL:-stable}"
+case "$channel" in
+    stable|prerelease)
+        ET_NONINTERACTIVE=1
+        ET_CACHE_TTL=0
+        ET_RELEASES_COUNT=20
+        ET_ALLOW_PRERELEASE=0
+        [ "$channel" != prerelease ] || ET_ALLOW_PRERELEASE=1
+        unset ET_VERSION
+        select_version >/dev/null || fail "could not select $channel release"
+        tag="$VER"
+        if [ "$channel" = prerelease ]; then
+            tag=$(awk '$2=="pre" {print $1; exit}' "$TMP_DIR/releases.txt")
+            [ -n "$tag" ] || fail 'no versioned pre-release available for this matrix job'
+        fi
+        ;;
+    nightly) tag=nightly ;;
+    *) fail "unknown test channel: $channel" ;;
+esac
+pass "$channel channel resolved to $tag"
 
-TMP_DIR="$TEST_DIR/download"
 ET_SHA256=''
 ET_ALLOW_UNVERIFIED=0
 do_download "$tag" x86_64 >/dev/null || fail 'manager download or official digest verification failed'
@@ -43,8 +58,9 @@ case "$(uname -s)" in
         ;;
 esac
 
-version=$($EXTRACT_DIR/easytier-core --version 2>/dev/null | awk '{print $2}' | cut -d- -f1)
-[ "v$version" = "$tag" ] || fail "core version $version does not match release $tag"
+_core_version_matches "$EXTRACT_DIR/easytier-core" "$DOWNLOAD_VERSION" || \
+    fail "core version does not match package version $DOWNLOAD_VERSION ($tag)"
+pass "core matches package $DOWNLOAD_VERSION: $("$EXTRACT_DIR/easytier-core" --version)"
 
 $EXTRACT_DIR/easytier-core --help | grep -q -- '--check-config' || fail 'core lost --check-config'
 $EXTRACT_DIR/easytier-core --help | grep -q -- '--machine-id' || fail 'core lost --machine-id'
@@ -76,7 +92,35 @@ _TOML_EXITNODE=false
 _TOML_USE_SMOLTCP=false
 _TOML_PRIVATE=true
 _TOML_COMPRESS=0
-_toml_write_config >/dev/null || fail 'latest stable core rejected the generated config'
+_toml_write_config >/dev/null || fail 'selected core rejected the generated config'
 grep -q '^relay_network_whitelist = "\*"$' "$ET_CORE_CONFIG_FILE" || fail 'generated config uses a stale whitelist field'
 grep -q 'wss://0.0.0.0:65535/' "$ET_CORE_CONFIG_FILE" || fail 'maximum valid derived port is incorrect'
-pass 'generated TOML is accepted by the latest stable core'
+pass 'generated TOML is accepted by the selected core'
+
+# Released cores only accept true/false for these names, and newer ones parse
+# ET_DHCP as a CIDR. The documented installer values must not reach the core.
+ET_DHCP=1; ET_PRIVATE_MODE=0; ET_ENABLE_EXIT_NODE=1; ET_USE_SMOLTCP=1
+export ET_DHCP ET_PRIVATE_MODE ET_ENABLE_EXIT_NODE ET_USE_SMOLTCP
+_validate_core_config "$ET_CORE_CONFIG_FILE" >/dev/null || fail 'exported installer settings broke config validation'
+unset ET_DHCP ET_PRIVATE_MODE ET_ENABLE_EXIT_NODE ET_USE_SMOLTCP
+pass 'exported installer settings do not reach the selected core'
+
+for option in --file-log-dir --file-log-level --file-log-size --file-log-count; do
+    "$EXTRACT_DIR/easytier-core" --help | grep -q -- "$option" || fail "core lost $option"
+done
+for option in --api-host --api-server-port --config-server-port --config-server-protocol; do
+    "$EXTRACT_DIR/easytier-web-embed" --help | grep -q -- "$option" || fail "web lost $option"
+done
+pass 'all generated service arguments remain available'
+
+_TOML_COMPRESS=3
+if _core_supports_lzo "$ET_CORE_BIN_FILE"; then
+    _toml_write_config >/dev/null || fail 'LZO config rejected by an advertising core'
+    grep -q '^data_compress_algo = 3$' "$ET_CORE_CONFIG_FILE" || fail 'LZO silently changed'
+    pass 'LZO configuration accepted without silently falling back'
+else
+    before=$(_sha256_file "$ET_CORE_CONFIG_FILE")
+    if _toml_write_config >/dev/null 2>&1; then fail 'unsupported LZO was accepted'; fi
+    [ "$before" = "$(_sha256_file "$ET_CORE_CONFIG_FILE")" ] || fail 'LZO failure changed the config'
+    pass 'core without LZO support is rejected before config replacement'
+fi
