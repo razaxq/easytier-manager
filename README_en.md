@@ -32,20 +32,20 @@ Install, configure and manage [EasyTier](https://github.com/EasyTier/EasyTier) o
 ## 🚀 Quick start
 
 ```sh
-curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh -o easytier.sh
-sudo sh easytier.sh
+curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | sudo sh
 ```
 
-> Requires `curl` and `unzip`; the script prints the matching install command if either is missing.
+Run this in a terminal to open the menu without saving a script file. You need `curl` and `unzip`. If you are already logged in as root, omit `sudo`.
 
-Subcommands (run and exit; no argument opens the menu):
+To run a single command, set the script URL in your current shell, then choose one of the commands below.
 
 ```sh
-sh easytier.sh status     # service status + network overview (easytier-cli peer/route)
-sh easytier.sh start      # start / stop / restart
-sh easytier.sh version    # print the script and core versions
-sh easytier.sh help       # help
-sudo sh easytier.sh rollback /var/lib/easytier-manager/backups/upgrade-SNAPSHOT
+ET_SCRIPT_URL=https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh
+curl -fsSL "$ET_SCRIPT_URL" | sh -s -- status      # service status and network overview
+curl -fsSL "$ET_SCRIPT_URL" | sudo sh -s -- start  # also accepts stop or restart
+curl -fsSL "$ET_SCRIPT_URL" | sh -s -- version     # script and core versions
+curl -fsSL "$ET_SCRIPT_URL" | sh -s -- help        # command help
+curl -fsSL "$ET_SCRIPT_URL" | sudo sh -s -- rollback /var/lib/easytier-manager/backups/upgrade-SNAPSHOT
 ```
 
 ---
@@ -59,8 +59,7 @@ Edit the values, then run the whole block. `sudo env` is used rather than `sudo 
 **Standalone node (TOML mode)**
 
 ```sh
-curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh -o easytier.sh
-sudo env \
+curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | sudo env \
   ET_NONINTERACTIVE=1 \
   ET_MODE=toml \
   ET_INSTANCE_NAME=mynode \
@@ -69,18 +68,18 @@ sudo env \
   ET_NETWORK_SECRET=change-me \
   ET_PEERS=tcp://public.easytier.cn:11010 \
   ET_LISTEN_PORT=11010 \
-  sh easytier.sh
+  sh
 ```
 
 **Join a Web console (Web mode)**
 
 ```sh
-sudo env \
+curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | sudo env \
   ET_NONINTERACTIVE=1 \
   ET_MODE=web \
   ET_INSTANCE_NAME=mynode \
   ET_WEB_URL=udp://console.example.com:22020/myuser \
-  sh easytier.sh
+  sh
 ```
 
 Optional additions to either block — a download mirror, a pinned version, and letting this node act as an exit node:
@@ -176,7 +175,7 @@ Pressing Enter in version selection installs the latest stable release by defaul
 
 Before upgrading an existing local Web console, the script stops core/web-embed and creates a cold snapshot of all managed binaries, the database and its `-wal`/`-shm`/`-journal` files, arguments, TOML, machine ID and service definitions. A backup failure aborts the upgrade and attempts to resume previously running services. `ET_BACKUP_KEEP=0` only disables ordinary binary/config backups; it does not disable these snapshots. Reserve storage for the installed programs and database for each retained snapshot. On OpenWrt, `/var` is commonly temporary: set `ET_UPGRADE_BACKUP_DIR` to a persistent mounted directory to retain recovery data across reboots.
 
-The upgrade prints the exact snapshot and restore command. Use `sudo sh easytier.sh rollback /absolute/path/to/snapshot` to restore the matching programs and database together. Rollback first saves the current state in a rescue snapshot and restores it if the requested recovery fails. It restores the snapshot's service running states. Database writes made after the selected snapshot are no longer present in the restored database; they remain in the rescue snapshot. Recovery requires the same managed file paths and database path; custom service/database layouts need separate handling. Uninstall leaves the default upgrade snapshot directory in place. They contain credentials and should stay private.
+The upgrade prints the snapshot path and the command to restore the matching programs and database together. Rollback first saves the current state in a rescue snapshot and restores it if the requested recovery fails. It restores the snapshot's service running states. Database writes made after the selected snapshot are no longer present in the restored database; they remain in the rescue snapshot. Recovery requires the same managed file paths and database path; custom service/database layouts need separate handling. Uninstall leaves the default upgrade snapshot directory in place. They contain credentials and should stay private.
 
 ## 🧪 Development
 
@@ -214,7 +213,7 @@ Upstream's initial migration seeds two accounts, `admin/admin` (superuser) and `
 Not automatically. The uninstall flow asks **separately** about backups, `/etc/easytier`, the machine identity and the Web database, and keeps everything by default.
 
 **Q: My network configuration disappeared from the Web console after an upgrade.**
-The console keys nodes by machine ID, and the default ID algorithm changed between older and newer releases. Since v2.6.1 the script triggers the legacy ID migration before replacing the binary and preserves `--machine-id` on reconfiguration. If the ID has already changed, recover the old one and reconfigure once with `ET_MACHINE_ID=<old-id> sh easytier.sh`.
+The console keys nodes by machine ID, and the default ID algorithm changed between older and newer releases. Since v2.6.1 the script triggers the legacy ID migration before replacing the binary and preserves `--machine-id` on reconfiguration. If the ID has already changed, recover the old ID. In the quick-start command, replace `sudo sh` with `sudo env ET_MACHINE_ID=your-old-id sh`, using the recovered value, then reconfigure once from the menu.
 
 ---
 

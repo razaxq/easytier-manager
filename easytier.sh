@@ -234,6 +234,18 @@ die()      { msg_err "$*"; exit 1; }
 # the shell then tries to run the label.  $1 command  $2 label
 _cmd_hint() { printf "    %-38s ${C_DIM}# %s${C_RST}\n" "$1" "$2"; }
 
+# Match help and recovery instructions to the way the manager was launched.
+_manager_command() {
+    case $- in
+        *s*)
+            local sudo_prefix=''
+            command -v sudo >/dev/null 2>&1 && sudo_prefix='sudo '
+            printf 'curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | %ssh -s --\n' "$sudo_prefix"
+            ;;
+        *)   printf "sh '%s'\n" "$(printf '%s' "$0" | sed "s/'/'\\\\''/g")" ;;
+    esac
+}
+
 # The log command for one service, per init system.
 #   $1 = binary   $2 = "recent" (default, for diagnosing) | "follow" (for watching)
 # Diagnosing a stopped service and watching a running one want different commands,
@@ -2025,7 +2037,7 @@ do_install_bins() {
             return 1
         fi
         msg_ok "$(t "Upgrade snapshot: $UPGRADE_SNAPSHOT" "升级快照：$UPGRADE_SNAPSHOT")"
-        msg_info "$(t "Restore with: sh easytier.sh rollback $UPGRADE_SNAPSHOT" "恢复命令：sh easytier.sh rollback $UPGRADE_SNAPSHOT")"
+        msg_info "$(t "Restore with" "恢复命令"): $(_manager_command) rollback '$UPGRADE_SNAPSHOT'"
     fi
 
     # Defer signals until the entire set passes final validation or is restored.
@@ -3404,7 +3416,7 @@ _usage() {
     cat <<USAGE
 $(t "EasyTier Manager" "EasyTier 管理脚本") v${SCRIPT_VERSION}
 
-$(t "Usage" "用法"): $(basename "$0") [command]
+$(t "Usage" "用法"): $(_manager_command) [command]
 
 $(t "Commands" "命令"):
   (none) | menu     $(t "interactive menu (default)" "交互式菜单（默认）")
@@ -3471,6 +3483,16 @@ main() {
         *)
             msg_err "$(t "Unknown command: $1" "未知命令: $1")"
             _usage; exit 2 ;;
+    esac
+
+    # With curl | sh, stdin carries the script. Only the menu needs keyboard input.
+    case $- in
+        *s*)
+            if [ "${ET_NONINTERACTIVE:-0}" != 1 ] && [ ! -t 0 ]; then
+                ( : </dev/tty ) 2>/dev/null || die "$(t "Open a terminal for the menu, or set ET_NONINTERACTIVE=1 for unattended installation" "请在终端中打开菜单，或设置 ET_NONINTERACTIVE=1 进行无人值守安装")"
+                exec </dev/tty
+            fi
+            ;;
     esac
 
     TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/et_mgr.XXXXXX") || return 1
@@ -3548,7 +3570,7 @@ main() {
         fi
         printf "  ─────────────────────────────────────────────────\n"
         printf '%s' "$(t "  Select: " "  请选择: ")"
-        read -r choice
+        read -r choice || return 1
 
         # ── Not installed: only "Install" and "Exit" ──────────────────
         if [ ! -f /usr/bin/easytier-core ]; then

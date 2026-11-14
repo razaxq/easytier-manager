@@ -32,21 +32,20 @@
 ## 🚀 快速开始
 
 ```sh
-curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh -o easytier.sh
-sudo env ET_LANG=zh sh easytier.sh
+curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | sudo env ET_LANG=zh sh
 ```
 
-> 需要 `curl` 与 `unzip`；缺失时脚本会提示对应安装命令。
-> 中文环境下 `sudo sh easytier.sh` 也会自动显示中文，`ET_LANG=zh` 用于在英文 / `C` locale 的主机上强制中文。
+在终端运行即可打开中文菜单，无需保存脚本文件。需要 `curl` 和 `unzip`。已使用 root 登录时可省略 `sudo`。
 
-子命令（执行后即退出，无参数则进入菜单）：
+也可以直接运行子命令。先在当前终端设置脚本地址，再按需执行其中一行。
 
 ```sh
-sh easytier.sh status     # 服务状态 + 网络概览（easytier-cli peer/route）
-sh easytier.sh start      # 启动 / stop 停止 / restart 重启
-sh easytier.sh version    # 打印脚本与 core 版本
-sh easytier.sh help       # 帮助
-sudo sh easytier.sh rollback /var/lib/easytier-manager/backups/upgrade-SNAPSHOT
+ET_SCRIPT_URL=https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh
+curl -fsSL "$ET_SCRIPT_URL" | ET_LANG=zh sh -s -- status          # 服务状态与网络概览
+curl -fsSL "$ET_SCRIPT_URL" | sudo env ET_LANG=zh sh -s -- start  # 也可使用 stop 或 restart
+curl -fsSL "$ET_SCRIPT_URL" | sh -s -- version                    # 脚本与 core 版本
+curl -fsSL "$ET_SCRIPT_URL" | ET_LANG=zh sh -s -- help            # 中文帮助
+curl -fsSL "$ET_SCRIPT_URL" | sudo env ET_LANG=zh sh -s -- rollback /var/lib/easytier-manager/backups/upgrade-SNAPSHOT
 ```
 
 ---
@@ -60,8 +59,7 @@ sudo sh easytier.sh rollback /var/lib/easytier-manager/backups/upgrade-SNAPSHOT
 **独立节点（TOML 模式）**
 
 ```sh
-curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh -o easytier.sh
-sudo env \
+curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | sudo env \
   ET_NONINTERACTIVE=1 \
   ET_LANG=zh \
   ET_MODE=toml \
@@ -71,19 +69,19 @@ sudo env \
   ET_NETWORK_SECRET=change-me \
   ET_PEERS=tcp://public.easytier.cn:11010 \
   ET_LISTEN_PORT=11010 \
-  sh easytier.sh
+  sh
 ```
 
 **接入 Web 控制台（Web 模式）**
 
 ```sh
-sudo env \
+curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | sudo env \
   ET_NONINTERACTIVE=1 \
   ET_LANG=zh \
   ET_MODE=web \
   ET_INSTANCE_NAME=mynode \
   ET_WEB_URL=udp://console.example.com:22020/myuser \
-  sh easytier.sh
+  sh
 ```
 
 按需追加到上面任意一段里 —— 下载镜像、锁定版本、允许本节点作为出口节点：
@@ -179,7 +177,7 @@ sudo env \
 
 升级已有的本机 Web 控制台前，脚本会停止 core/web-embed，备份所有受管理程序、数据库及其 `-wal`/`-shm`/`-journal` 文件、启动参数、TOML、机器 ID 和服务定义。备份失败会中止升级，并尝试恢复原先运行的服务。`ET_BACKUP_KEEP=0` 仅关闭普通程序/配置备份，不关闭完整升级快照。每份快照需容纳已安装程序和数据库，请预留存储空间。OpenWrt 的 `/var` 通常为临时存储；需要跨重启保留快照时，请将 `ET_UPGRADE_BACKUP_DIR` 设为已挂载的持久存储目录。
 
-升级时会显示实际快照路径和恢复命令。执行 `sudo sh easytier.sh rollback /快照的绝对路径`，即可成套恢复对应程序和数据库。回退前会先保存当前状态的恢复快照；目标快照恢复失败时，会尝试恢复回退前的状态。服务是否启动按所选快照记录的状态恢复。回退后的数据库不包含该快照之后的新写入，这些内容保留在回退前的恢复快照中。恢复要求受管理文件路径及数据库路径一致；自定义服务或数据库布局需要单独处理。卸载会保留默认目录中的完整升级快照；其中包含凭据，请保持目录私有。
+升级时会显示实际快照路径和恢复命令。执行该命令即可成套恢复对应程序和数据库。回退前会先保存当前状态的恢复快照；目标快照恢复失败时，会尝试恢复回退前的状态。服务是否启动按所选快照记录的状态恢复。回退后的数据库不包含该快照之后的新写入，这些内容保留在回退前的恢复快照中。恢复要求受管理文件路径及数据库路径一致；自定义服务或数据库布局需要单独处理。卸载会保留默认目录中的完整升级快照；其中包含凭据，请保持目录私有。
 
 ## 🧪 开发
 
@@ -217,7 +215,7 @@ CI 执行 ShellCheck 和单元测试；每周分别下载稳定版、预发布�
 不会自动删。卸载流程**分步**询问是否删除备份、`/etc/easytier`、机器身份和 Web 数据库，默认全部保留。
 
 **Q: 升级后 Web 控制台里原网络配置不见了？**
-控制台按机器 ID 关联节点。旧版到新版的默认 ID 算法曾发生迁移；脚本自 v2.6.1 起会在替换二进制前触发旧 ID 迁移，并在重配时保留 `--machine-id`。若 ID 已变化，需先找回旧 ID 再执行 `ET_MACHINE_ID=<旧ID> sh easytier.sh` 重配一次。
+控制台按机器 ID 关联节点。旧版到新版的默认 ID 算法曾发生迁移；脚本自 v2.6.1 起会在替换二进制前触发旧 ID 迁移，并在重配时保留 `--machine-id`。若 ID 已变化，先找回旧 ID，在快速开始命令的 `ET_LANG=zh` 后加上 `ET_MACHINE_ID=旧ID`（替换为实际值），打开菜单并重新配置一次。
 
 ---
 
