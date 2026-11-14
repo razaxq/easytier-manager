@@ -61,4 +61,4 @@ nightly 是滚动标签；上表记录本次实际下载结果，不保证未来
 - 审查后追加的修复已重新执行本地单元测试、ShellCheck 和三个渠道的联网兼容性检查；未在 mawk 上实测。
 - CI 工作流已经更新，本地等效检查通过；尚未推送，因此本次没有新的 GitHub Actions 运行记录。
 
-复现命令和恢复用法见 [中文说明](README_zh.md) 与 [English](README.md)。
+复现命令和恢复用法见 [中文说明](README.md) 与 [English](README_en.md)。
