@@ -239,7 +239,9 @@ _manager_command() {
     case $- in
         *s*)
             local sudo_prefix=''
-            command -v sudo >/dev/null 2>&1 && sudo_prefix='sudo '
+            if [ "$(id -u)" != 0 ] && command -v sudo >/dev/null 2>&1; then
+                sudo_prefix='sudo '
+            fi
             printf 'curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | %ssh -s --\n' "$sudo_prefix"
             ;;
         *)   printf "sh '%s'\n" "$(printf '%s' "$0" | sed "s/'/'\\\\''/g")" ;;

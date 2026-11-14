@@ -31,21 +31,23 @@ Install, configure and manage [EasyTier](https://github.com/EasyTier/EasyTier) o
 
 ## 🚀 Quick start
 
+On OpenWrt, log in as root and run this command to open the menu. You need `curl` and `unzip`. The command runs without `sudo` or a local script file.
+
 ```sh
-curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | sudo sh
+curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | sh
 ```
 
-Run this in a terminal to open the menu without saving a script file. You need `curl` and `unzip`. If you are already logged in as root, omit `sudo`.
+The same command works in a root shell on other Linux systems. If your account has sudo access, you can run `sudo -i` before installing, managing services or restoring a snapshot.
 
 To run a single command, set the script URL in your current shell, then choose one of the commands below.
 
 ```sh
 ET_SCRIPT_URL=https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh
-curl -fsSL "$ET_SCRIPT_URL" | sh -s -- status      # service status and network overview
-curl -fsSL "$ET_SCRIPT_URL" | sudo sh -s -- start  # also accepts stop or restart
-curl -fsSL "$ET_SCRIPT_URL" | sh -s -- version     # script and core versions
-curl -fsSL "$ET_SCRIPT_URL" | sh -s -- help        # command help
-curl -fsSL "$ET_SCRIPT_URL" | sudo sh -s -- rollback /var/lib/easytier-manager/backups/upgrade-SNAPSHOT
+curl -fsSL "$ET_SCRIPT_URL" | sh -s -- status   # service status and network overview
+curl -fsSL "$ET_SCRIPT_URL" | sh -s -- start    # also accepts stop or restart
+curl -fsSL "$ET_SCRIPT_URL" | sh -s -- version  # script and core versions
+curl -fsSL "$ET_SCRIPT_URL" | sh -s -- help     # command help
+curl -fsSL "$ET_SCRIPT_URL" | sh -s -- rollback /var/lib/easytier-manager/backups/upgrade-SNAPSHOT
 ```
 
 ---
@@ -54,12 +56,12 @@ curl -fsSL "$ET_SCRIPT_URL" | sudo sh -s -- rollback /var/lib/easytier-manager/b
 
 ### Copy-paste configuration
 
-Edit the values, then run the whole block. `sudo env` is used rather than `sudo VAR=…` because the default sudoers policy refuses variables set on the sudo command line.
+Edit the values, then run the block for your configuration in a root shell.
 
 **Standalone node (TOML mode)**
 
 ```sh
-curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | sudo env \
+curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | \
   ET_NONINTERACTIVE=1 \
   ET_MODE=toml \
   ET_INSTANCE_NAME=mynode \
@@ -74,7 +76,7 @@ curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh 
 **Join a Web console (Web mode)**
 
 ```sh
-curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | sudo env \
+curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | \
   ET_NONINTERACTIVE=1 \
   ET_MODE=web \
   ET_INSTANCE_NAME=mynode \
@@ -213,7 +215,7 @@ Upstream's initial migration seeds two accounts, `admin/admin` (superuser) and `
 Not automatically. The uninstall flow asks **separately** about backups, `/etc/easytier`, the machine identity and the Web database, and keeps everything by default.
 
 **Q: My network configuration disappeared from the Web console after an upgrade.**
-The console keys nodes by machine ID, and the default ID algorithm changed between older and newer releases. Since v2.6.1 the script triggers the legacy ID migration before replacing the binary and preserves `--machine-id` on reconfiguration. If the ID has already changed, recover the old ID. In the quick-start command, replace `sudo sh` with `sudo env ET_MACHINE_ID=your-old-id sh`, using the recovered value, then reconfigure once from the menu.
+The console keys nodes by machine ID, and the default ID algorithm changed between older and newer releases. Since v2.6.1 the script triggers the legacy ID migration before replacing the binary and preserves `--machine-id` on reconfiguration. If the ID has already changed, recover the old ID. In the quick-start command, insert `ET_MACHINE_ID=your-old-id` between the pipe and `sh`, using the recovered value, then reconfigure once from the menu.
 
 ---
 

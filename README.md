@@ -31,21 +31,23 @@
 
 ## 🚀 快速开始
 
+在 OpenWrt 上以 root 登录后，直接运行下面的命令打开中文菜单。需要 `curl` 和 `unzip`，无需安装 `sudo` 或保存脚本文件。
+
 ```sh
-curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | sudo env ET_LANG=zh sh
+curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | ET_LANG=zh sh
 ```
 
-在终端运行即可打开中文菜单，无需保存脚本文件。需要 `curl` 和 `unzip`。已使用 root 登录时可省略 `sudo`。
+在其他 Linux 系统上也可以用 root 执行。若当前使用有 sudo 权限的普通账号，可先运行 `sudo -i`，再执行安装、服务管理或回滚命令。
 
 也可以直接运行子命令。先在当前终端设置脚本地址，再按需执行其中一行。
 
 ```sh
 ET_SCRIPT_URL=https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh
-curl -fsSL "$ET_SCRIPT_URL" | ET_LANG=zh sh -s -- status          # 服务状态与网络概览
-curl -fsSL "$ET_SCRIPT_URL" | sudo env ET_LANG=zh sh -s -- start  # 也可使用 stop 或 restart
-curl -fsSL "$ET_SCRIPT_URL" | sh -s -- version                    # 脚本与 core 版本
-curl -fsSL "$ET_SCRIPT_URL" | ET_LANG=zh sh -s -- help            # 中文帮助
-curl -fsSL "$ET_SCRIPT_URL" | sudo env ET_LANG=zh sh -s -- rollback /var/lib/easytier-manager/backups/upgrade-SNAPSHOT
+curl -fsSL "$ET_SCRIPT_URL" | ET_LANG=zh sh -s -- status  # 服务状态与网络概览
+curl -fsSL "$ET_SCRIPT_URL" | ET_LANG=zh sh -s -- start   # 也可使用 stop 或 restart
+curl -fsSL "$ET_SCRIPT_URL" | sh -s -- version            # 脚本与 core 版本
+curl -fsSL "$ET_SCRIPT_URL" | ET_LANG=zh sh -s -- help    # 中文帮助
+curl -fsSL "$ET_SCRIPT_URL" | ET_LANG=zh sh -s -- rollback /var/lib/easytier-manager/backups/upgrade-SNAPSHOT
 ```
 
 ---
@@ -54,12 +56,12 @@ curl -fsSL "$ET_SCRIPT_URL" | sudo env ET_LANG=zh sh -s -- rollback /var/lib/eas
 
 ### 直接复制粘贴的配置
 
-改好取值后整段执行即可。这里用 `sudo env` 而不是 `sudo VAR=…`，因为默认的 sudoers 策略会拒绝在 sudo 命令行上设置环境变量。
+改好取值后，在 root 终端中执行对应的整段命令。
 
 **独立节点（TOML 模式）**
 
 ```sh
-curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | sudo env \
+curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | \
   ET_NONINTERACTIVE=1 \
   ET_LANG=zh \
   ET_MODE=toml \
@@ -75,7 +77,7 @@ curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh 
 **接入 Web 控制台（Web 模式）**
 
 ```sh
-curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | sudo env \
+curl -fsSL https://cdn.jsdelivr.net/gh/razaxq/easytier-manager@main/easytier.sh | \
   ET_NONINTERACTIVE=1 \
   ET_LANG=zh \
   ET_MODE=web \
