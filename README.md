@@ -5,9 +5,8 @@
 [![ShellCheck](https://github.com/razaxq/easytier-manager/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/razaxq/easytier-manager/actions/workflows/shellcheck.yml)
 [![Upstream compatibility](https://github.com/razaxq/easytier-manager/actions/workflows/upstream-compat.yml/badge.svg)](https://github.com/razaxq/easytier-manager/actions/workflows/upstream-compat.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![POSIX sh](https://img.shields.io/badge/shell-POSIX%20sh-blue.svg)](#)
 
-在 Linux 上**安装、配置与管理 [EasyTier](https://github.com/EasyTier/EasyTier)** 的交互式脚本。纯 POSIX `sh`，无 Bash / Python 依赖。
+通过交互式菜单在 Linux 上安装、配置和管理 [EasyTier](https://github.com/EasyTier/EasyTier)。
 
 > 第三方脚本，与上游项目无隶属关系。EasyTier 二进制的版权归其作者所有。
 
@@ -207,9 +206,6 @@ CI 执行 ShellCheck 和单元测试；每周分别下载稳定版、预发布�
 ---
 
 ## ❓ 常见问题
-
-**Q: 为什么是 `/bin/sh` 而不是 Bash？**
-兼容 OpenWrt（BusyBox ash）和 Alpine（默认无 Bash），让脚本在路由器上也能跑。
 
 **Q: 下载或 SHA-256 查询失败？**
 大陆用户可用 `ET_GITHUB_MIRROR` 走下载镜像或设 `https_proxy`；API 限流时设 `ET_GITHUB_TOKEN`。镜像不被信任为摘要来源，脚本仍从官方 GitHub API 取 SHA-256；也可手动设置官方 `ET_SHA256`。仅在明确接受风险时使用 `ET_ALLOW_UNVERIFIED=1`。官方 API 不可达时，带版本号的标签仍按标准资产名下载，但此时没有官方摘要，必须手动设置 `ET_SHA256`（或显式接受 `ET_ALLOW_UNVERIFIED=1`）；`nightly` 文件名不固定，必须能访问官方 API。

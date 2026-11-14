@@ -5,9 +5,8 @@
 [![ShellCheck](https://github.com/razaxq/easytier-manager/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/razaxq/easytier-manager/actions/workflows/shellcheck.yml)
 [![Upstream compatibility](https://github.com/razaxq/easytier-manager/actions/workflows/upstream-compat.yml/badge.svg)](https://github.com/razaxq/easytier-manager/actions/workflows/upstream-compat.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![POSIX sh](https://img.shields.io/badge/shell-POSIX%20sh-blue.svg)](#)
 
-An interactive script to **install, configure and manage [EasyTier](https://github.com/EasyTier/EasyTier)** on Linux. Pure POSIX `sh` — no Bash, Python or other runtime dependency.
+Install, configure and manage [EasyTier](https://github.com/EasyTier/EasyTier) on Linux through an interactive menu.
 
 > A third-party script, not affiliated with the upstream project. EasyTier binaries remain the copyright of their authors.
 
@@ -204,9 +203,6 @@ CI runs ShellCheck and the unit tests; a weekly matrix downloads stable, version
 ---
 
 ## ❓ FAQ
-
-**Q: Why `/bin/sh` instead of Bash?**
-To stay compatible with OpenWrt (BusyBox ash) and Alpine (no Bash by default), so the script also runs on routers.
 
 **Q: The download or the SHA-256 lookup fails.**
 Use `ET_GITHUB_MIRROR` for a download mirror or set `https_proxy`; set `ET_GITHUB_TOKEN` when the API is rate-limited. A mirror is never trusted as the digest source — the script still fetches the SHA-256 from the official GitHub API. When the official API is unreachable, a versioned tag is still downloaded by its standard asset name, but no official digest is available, so `ET_SHA256` must be set by hand (or `ET_ALLOW_UNVERIFIED=1` accepted explicitly); `nightly` has no fixed filename and always needs the official API. Use `ET_ALLOW_UNVERIFIED=1` only if you explicitly accept the risk.
